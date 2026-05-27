@@ -1,0 +1,268 @@
+// =============================================================================
+//  infra/jenkins/Jenkinsfile-ai — VMD AI Worker Rolling Deploy (Option A)
+// -----------------------------------------------------------------------------
+//  설계 근거: operations_activation_plan.md §1.3, §11
+//
+//  배포 모델: Option A (Jenkins 호스트 직접 빌드, no registry, no SSH)
+//
+//  ⚠️ 현재 비활성:
+//    ai-worker/ 디렉터리가 부트스트랩 미완료 (entrypoint.sh, ai_app/ 부재).
+//    본 파이프라인은 코드 베이스만 정합화한 상태이고, 실제 트리거 시 build
+//    단계에서 실패. AI 팀 부트스트랩 후 vmd-deploy-ai Job 생성 + 첫 트리거
+//    (operations_activation_plan.md §11 참조).
+//
+//  왜 Blue/Green 이 아닌가 (plan §2.2, D2 결정):
+//    - YOLO 모델(200~500MB) + PyTorch 상주 메모리를 두 벌 올리면 16GB 호스트
+//      에서 OOM 위험 즉시 (Blue+Green ~ 12GB 상주).
+//    - AI Worker 는 Celery 큐 소비자 — 짧은 downtime 은 Redis 큐가 흡수.
+//      acks_late=True + task_reject_on_worker_lost=True 로 in-flight 작업은
+//      브로커가 재큐잉.
+//
+//  파라미터:
+//    GIT_BRANCH    배포할 브랜치 (default: dev — BE 와 같은 release 브랜치)
+//    SKIP_SMOKE    배포 후 celery ping 건너뛰기
+//
+//  실행 흐름:
+//    A)  /opt/vmd/source 를 origin/$GIT_BRANCH 에 hard reset
+//    A2) Jenkins Credentials 의 vmd-prod-env → disk 복사
+//    B)  ai-worker 이미지 빌드 (현재 worktree)
+//    C)  이전 ai-worker stop (메모리 해제)
+//    D)  새 ai-worker 기동 (--force-recreate)
+//    E)  docker inspect Health.Status 폴링 (최대 3분; 모델 warmup 포함)
+//    F)  celery ping smoke
+//
+//  자동 롤백:
+//    - Stop-and-Start 특성상 이전 컨테이너 복원 불가
+//    - 실패 시 운영자가 이전 SHA 로 git checkout + 재배포
+//    - in-flight 작업 손실 없음 (브로커 큐에 보존)
+//
+//  Jenkins 전제:
+//    - jenkins 사용자가 docker 그룹
+//    - /opt/vmd/source 가 jenkins 쓰기 가능
+//    - Credentials: vmd-prod-env (Secret file)
+// =============================================================================
+
+pipeline {
+    agent any
+
+    parameters {
+        string(
+            name: 'GIT_BRANCH',
+            defaultValue: 'dev',
+            description: '배포할 브랜치 (default: dev)'
+        )
+        booleanParam(
+            name: 'SKIP_SMOKE',
+            defaultValue: false,
+            description: 'celery ping smoke check 건너뛰기'
+        )
+    }
+
+    options {
+        timestamps()
+        ansiColor('xterm')
+        disableConcurrentBuilds()
+        timeout(time: 30, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '30'))
+    }
+
+    environment {
+        // Git plugin 이 SCM checkout 단계에서 GIT_BRANCH=origin/<branch> 로 자동 set
+        // → parameter 의 GIT_BRANCH 를 명시 override 안 하면 'git fetch origin origin/dev' 가 됨
+        GIT_BRANCH      = "${params.GIT_BRANCH}"
+        SOURCE_DIR      = '/opt/vmd/source'
+        CONTAINER_NAME  = 'vmd-ai-worker'
+        HEALTH_WAIT_SEC = '180'
+    }
+
+    stages {
+
+        // ══════════════ A. Sync ══════════════
+        stage('A. Sync canonical source') {
+            steps {
+                sh '''#!/usr/bin/env bash
+                    set -euo pipefail
+                    cd "$SOURCE_DIR"
+                    git fetch --quiet origin "$GIT_BRANCH"
+                    git checkout --quiet "$GIT_BRANCH"
+                    git reset --hard "origin/$GIT_BRANCH"
+                    git rev-parse --short HEAD > .deploy_sha
+                    echo "[deploy] $SOURCE_DIR @ $(cat .deploy_sha) (branch $GIT_BRANCH)"
+                '''
+                script {
+                    env.NEW_SHA = sh(
+                        returnStdout: true,
+                        script: 'cat "$SOURCE_DIR/.deploy_sha"'
+                    ).trim()
+                    echo """
+                    ═══════════════ VMD AI Deploy ═══════════════
+                      branch    : ${params.GIT_BRANCH}
+                      sha       : ${env.NEW_SHA}
+                      container : ${env.CONTAINER_NAME}
+                      strategy  : Stop-and-Start Rolling
+                      build     : ${env.BUILD_URL}
+                    ═════════════════════════════════════════════
+                    """.stripIndent()
+                }
+            }
+        }
+
+        // ══════════════ A2. Sync prod env (Jenkins Credentials → disk) ══════════════
+        stage('A2. Sync prod env from Jenkins Credentials') {
+            steps {
+                withCredentials([file(credentialsId: 'vmd-prod-env', variable: 'PROD_ENV_FILE')]) {
+                    sh '''#!/usr/bin/env bash
+                        set -euo pipefail
+                        install -m 600 "$PROD_ENV_FILE" "$SOURCE_DIR/infra/env/prod.env"
+                        echo "[deploy] synced prod.env from Jenkins Credentials (vmd-prod-env)"
+                    '''
+                }
+            }
+        }
+
+        // ══════════════ B. Build ══════════════
+        stage('B. Build ai-worker image') {
+            steps {
+                sh '''#!/usr/bin/env bash
+                    set -euo pipefail
+                    cd "$SOURCE_DIR/infra/compose"
+                    docker compose --env-file ../env/prod.env -f docker-compose.prod.yml \
+                      build ai-worker
+                '''
+            }
+        }
+
+        // ══════════════ C. Stop old ai-worker (메모리 해제) ══════════════
+        // stop_grace_period=120s (compose 정의) — in-flight 작업은 SIGTERM 받고
+        // acks_late 덕에 브로커로 재큐잉됨.
+        stage('C. Stop old ai-worker') {
+            steps {
+                sh '''#!/usr/bin/env bash
+                    set -euo pipefail
+                    cd "$SOURCE_DIR/infra/compose"
+                    docker compose --env-file ../env/prod.env -f docker-compose.prod.yml \
+                      stop ai-worker || true
+                '''
+            }
+        }
+
+        // ══════════════ D. Start new ai-worker ══════════════
+        stage('D. Start new ai-worker') {
+            steps {
+                sh '''#!/usr/bin/env bash
+                    set -euo pipefail
+                    cd "$SOURCE_DIR/infra/compose"
+                    docker compose --env-file ../env/prod.env -f docker-compose.prod.yml \
+                      up -d --force-recreate ai-worker
+                '''
+            }
+        }
+
+        // ══════════════ E. Wait healthy ══════════════
+        // compose healthcheck: /tmp/worker_ready (모델 로드 완료 flag) + celery ping.
+        // 호스트에서 docker inspect 로 Health.Status 폴링 (모델 warmup 시간 감안 3분).
+        stage('E. Wait until healthy') {
+            steps {
+                sh '''#!/usr/bin/env bash
+                    set -euo pipefail
+                    CONTAINER="$CONTAINER_NAME"
+                    TIMEOUT="$HEALTH_WAIT_SEC"
+                    echo "[ai/wait] polling docker inspect for healthy (timeout ${TIMEOUT}s)"
+                    deadline=$(( $(date +%s) + TIMEOUT ))
+                    attempt=0
+                    while (( $(date +%s) < deadline )); do
+                      attempt=$(( attempt + 1 ))
+                      status=$(docker inspect -f '{{.State.Health.Status}}' "$CONTAINER" 2>/dev/null || echo "absent")
+                      case "$status" in
+                        healthy)
+                          echo "[ai/wait] HEALTHY after attempt #${attempt}"
+                          exit 0 ;;
+                        unhealthy)
+                          echo "[ai/wait] UNHEALTHY — dumping last 200 lines" >&2
+                          docker logs --tail 200 "$CONTAINER" 2>&1 | sed 's/^/  /' >&2 || true
+                          exit 1 ;;
+                        absent)
+                          echo "[ai/wait] container not found yet (attempt #${attempt})" ;;
+                        *)
+                          echo "[ai/wait] attempt #${attempt}: status=$status  remaining=$(( deadline - $(date +%s) ))s" ;;
+                      esac
+                      sleep 5
+                    done
+                    echo "[ai/wait] TIMEOUT — $CONTAINER did not become healthy in ${TIMEOUT}s" >&2
+                    docker logs --tail 200 "$CONTAINER" 2>&1 | sed 's/^/  /' >&2 || true
+                    exit 1
+                '''
+            }
+        }
+
+        // ══════════════ F. Smoke ══════════════
+        stage('F. Celery ping smoke') {
+            when { expression { !params.SKIP_SMOKE } }
+            steps {
+                sh '''#!/usr/bin/env bash
+                    set -euo pipefail
+                    docker exec "$CONTAINER_NAME" \
+                      celery -A ai_app inspect ping -d "celery@$(docker exec $CONTAINER_NAME hostname)"
+                '''
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "[AI Deploy OK]  sha=${env.NEW_SHA}  duration=${currentBuild.durationString}"
+            script { notifyMattermost('SUCCESS', '#36a64f', "✅") }
+        }
+        failure {
+            // Stop-and-Start trade-off: 이전 컨테이너 복원 불가.
+            // 운영자는 이전 SHA 로 git checkout 후 재트리거. 큐는 안전.
+            echo "[AI Deploy FAIL]  sha=${env.NEW_SHA ?: 'n/a'}  → 이전 SHA 로 재트리거 필요 (큐는 안전, in-flight 작업 손실 없음)  ${env.BUILD_URL}console"
+            script { notifyMattermost('FAILURE', '#d62728', "❌") }
+        }
+        aborted {
+            echo "[AI Deploy ABORTED]  sha=${env.NEW_SHA ?: 'n/a'}"
+            script { notifyMattermost('ABORTED', '#7f7f7f', "🚫") }
+        }
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Helpers
+// ═════════════════════════════════════════════════════════════════════════════
+
+// Mattermost 알림 — Jenkins Credentials 'mm-webhook-deploy' (Secret text) 사용.
+// 실패 시 빌드 자체에 영향 안 주도록 try/catch 로 감쌈 (mm 장애 ≠ 배포 fail).
+//
+// AI 는 Stop-and-Start Rolling (Blue/Green 없음). 실패 시 큐는 Redis 가 보존하므로
+// in-flight 작업 손실 없음 — mm 알림에서 이전 SHA 재트리거 가이드.
+void notifyMattermost(String result, String color, String emoji) {
+    try {
+        withCredentials([string(credentialsId: 'mm-webhook-deploy', variable: 'MM_URL')]) {
+            String payload = """
+            {
+              "username": "Jenkins",
+              "icon_emoji": ":jenkins:",
+              "attachments": [{
+                "color": "${color}",
+                "title": "${emoji} VMD AI Deploy ${result}",
+                "title_link": "${env.BUILD_URL}console",
+                "fields": [
+                  {"title": "Branch",   "value": "${params.GIT_BRANCH}",        "short": true},
+                  {"title": "SHA",      "value": "${env.NEW_SHA ?: 'n/a'}",     "short": true},
+                  {"title": "Duration", "value": "${currentBuild.durationString}", "short": true}
+                ]
+              }]
+            }
+            """.trim()
+
+            sh """#!/usr/bin/env bash
+                set -e
+                curl -fsS -X POST -H 'Content-type: application/json; charset=utf-8' \\
+                  --data '${payload.replace("'", "'\\''")}' \\
+                  "\$MM_URL"
+            """
+        }
+    } catch (Throwable t) {
+        echo "[mm-notify][WARN] notification failed: ${t.message}"
+    }
+}

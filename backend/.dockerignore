@@ -1,0 +1,80 @@
+# =============================================================================
+#  Backend build context exclusions
+#  근거: infra/.ai/plan/dockerfile_plan.md §3.4
+#
+#  목적: 컨텍스트 최소화 + 시크릿/로컬 파일 차단 + collectstatic 충돌 방지
+# =============================================================================
+
+# Git / OS 메타데이터
+.git
+.gitignore
+.gitattributes
+.DS_Store
+Thumbs.db
+
+# Python 가상환경 (호스트 전용)
+.venv
+venv
+env
+ENV
+
+# Python 캐시 / 컴파일 산출물
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+
+# 테스트 / 린터 / 타입체크 캐시
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.tox
+.cache
+
+# 커버리지
+.coverage
+.coverage.*
+htmlcov
+coverage.xml
+*.cover
+
+# 로컬 DB / 사용자 업로드 (S3 사용 → 컨테이너에 들어가면 안 됨)
+db.sqlite3
+db.sqlite3-journal
+media
+assets
+
+# 빌드 시점에 collectstatic 으로 새로 생성되므로 컨텍스트에서 제외
+staticfiles
+
+# 환경 변수
+.env
+.env.*
+!.env.example
+
+# 로그
+*.log
+logs
+
+# 문서 / 빌드 메타
+README.md
+README*
+CHANGELOG.md
+LICENSE
+docs
+Dockerfile
+.dockerignore
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+
+# 테스트 산출물
+tests/_artifacts
+tests/__snapshots__
+
+# CI / GitLab
+.gitlab
+.gitlab-ci.yml

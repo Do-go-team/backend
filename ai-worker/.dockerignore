@@ -1,0 +1,58 @@
+# Git / OS
+.git
+.gitignore
+.gitattributes
+.DS_Store
+Thumbs.db
+
+# Python env/cache
+.venv
+venv
+env
+ENV
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.cache/
+
+# AI artifacts (do not send to build context)
+runs/
+datasets/
+thumbnails/
+models/
+*.pt
+*.pth
+*.onnx
+*.engine
+*.weights
+*.h5
+checkpoints/
+result.json
+
+# Notebook / docs / CI noise
+notebooks/
+*.ipynb
+.ipynb_checkpoints/
+docs/
+.gitlab/
+.gitlab-ci.yml
+
+# Logs
+*.log
+logs/
+
+# Env files
+.env
+.env.*
+!.env.example
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo

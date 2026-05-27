@@ -1,0 +1,27 @@
+{
+  "policy": {
+    "_meta": {
+      "description": "VMD 로그 ILM 정책 — rollover 1d/1gb, retention 7d. observability_elk_plan.md §D3 근거."
+    },
+    "phases": {
+      "hot": {
+        "min_age": "0ms",
+        "actions": {
+          "rollover": {
+            "max_age": "1d",
+            "max_primary_shard_size": "1gb"
+          },
+          "set_priority": {
+            "priority": 100
+          }
+        }
+      },
+      "delete": {
+        "min_age": "7d",
+        "actions": {
+          "delete": {}
+        }
+      }
+    }
+  }
+}

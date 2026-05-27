@@ -1,0 +1,693 @@
+# =============================================================================
+#  VMD Production Docker Compose
+# -----------------------------------------------------------------------------
+#  설계 근거: infra/.ai/plan/vmd_infra_plan.md §2.2
+#
+#  배포 패턴: Option A (호스트 직접 빌드, no registry)
+#    SSAFY GitLab Container Registry 비활성 정책으로 인해, 모든 이미지는
+#    Jenkins 호스트(EC2)에서 직접 build → run. compose 가 서비스명 기준으로
+#    이미지를 자동 태깅 (vmd-prod-django-blue 등).
+#
+#  사용 예:
+#    # 평상시(Blue Django + 단일 ai-worker 운영):
+#    docker compose --env-file ../env/prod.env -f docker-compose.prod.yml up -d
+#
+#    # Django Green standby 기동 (BE 배포 시):
+#    docker compose --env-file ../env/prod.env -f docker-compose.prod.yml \
+#      --profile green build django-green
+#    docker compose --env-file ../env/prod.env -f docker-compose.prod.yml \
+#      --profile green up -d django-green
+#
+#    # AI Worker 롤링 재시작 (AI 배포 시, stop-and-start):
+#    docker compose --env-file ../env/prod.env -f docker-compose.prod.yml \
+#      build ai-worker
+#    docker compose --env-file ../env/prod.env -f docker-compose.prod.yml stop ai-worker
+#    docker compose --env-file ../env/prod.env -f docker-compose.prod.yml \
+#      up -d --force-recreate ai-worker
+#
+#    # Frontend 산출물 export (FE 배포 시 1회):
+#    docker compose --env-file ../env/prod.env -f docker-compose.prod.yml \
+#      --profile frontend run --rm --build frontend-builder
+#
+#  핵심 원칙:
+#    1) 파이프라인 분리 — BE(Blue/Green) / FE(Export-once) / AI(Rolling)
+#    2) 공유 자원: postgres / redis / nginx + named volumes
+#    3) Fail-fast: 필수 시크릿/식별자는 ${VAR:?...} 로 부재 시 즉시 에러
+#    4) Resource limits: 단일 호스트 16GB RAM 보호 (deploy.resources.limits)
+#    5) YAML anchors: x-django-common / x-ai-common / x-default-logging 으로
+#       BE Blue/Green 중복 제거 + AI 공통 설정 재사용
+#    6) Option A: image 라벨 미지정 → compose 자동 태깅. 롤백은 git checkout
+#       <prev-SHA> + 재빌드 패턴 (registry pull 불가).
+#
+#  ⚠️ 호스트 사전 준비 (첫 배포 전):
+#    - /opt/vmd/models/yolov11s-seg.pt (chown 10001:10001)
+#    - /etc/letsencrypt (acme 인증서)
+#  ⚠️ 메모리 budget (16GB):
+#    정상 운영(Blue + ai-worker + 공유): ~13GB
+#    BE 배포 중(Blue + Green Django 동시): ~15GB — 짧은 cutover 동안만 허용
+#    AI 는 Stop-and-Start 롤링이므로 메모리 2배화 없음 (플랜 §2.2 결정 변경)
+# =============================================================================
+
+name: vmd-prod
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Reusable YAML Anchors
+# ─────────────────────────────────────────────────────────────────────────────
+
+# 모든 서비스 공통 로깅 (json-file, 로테이션)
+x-default-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+    tag: "{{.Name}}"
+
+# Django(Blue/Green) + Celery worker 공통 설정
+x-django-common: &django-common
+  build:
+    context: ../../backend
+    dockerfile: Dockerfile
+  env_file:
+    - ../env/prod.env
+  environment:
+    DJANGO_SETTINGS_MODULE: ${DJANGO_SETTINGS_MODULE:-config.settings}
+    DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:?DJANGO_SECRET_KEY is required}
+    DATABASE_URL: postgres://${POSTGRES_USER:?POSTGRES_USER is required}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/${POSTGRES_DB:?POSTGRES_DB is required}
+    REDIS_URL: ${REDIS_URL:?REDIS_URL is required}
+    CELERY_BROKER_URL: ${CELERY_BROKER_URL:?CELERY_BROKER_URL is required}
+    CELERY_RESULT_BACKEND: ${CELERY_RESULT_BACKEND:?CELERY_RESULT_BACKEND is required}
+    TZ: ${TZ:-Asia/Seoul}
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+  networks:
+    - vmd-internal
+  restart: unless-stopped
+  logging: *default-logging
+
+# AI Worker(Blue/Green) 공통 설정
+x-ai-common: &ai-common
+  build:
+    context: ../../ai-worker
+    dockerfile: Dockerfile
+  env_file:
+    - ../env/prod.env
+  environment:
+    # AI 전용 Redis DB 오버라이드 허용.
+    # ../env/prod.env에 AI_CELERY_BROKER_URL / AI_CELERY_RESULT_BACKEND가 설정되어 있으면
+    # 해당 값을 사용하고, 설정되어 있지 않으면 CELERY_* 기본값을 사용합니다.
+    AI_CELERY_BROKER_URL: ${AI_CELERY_BROKER_URL:-${CELERY_BROKER_URL:?CELERY_BROKER_URL is required}}
+    AI_CELERY_RESULT_BACKEND: ${AI_CELERY_RESULT_BACKEND:-${CELERY_RESULT_BACKEND:?CELERY_RESULT_BACKEND is required}}
+    YOLO_MODEL_PATH: ${YOLO_MODEL_PATH:-/models/best.pt}
+    YOLO_DEVICE: ${YOLO_DEVICE:-cpu}
+    YOLO_READY_FLAG_PATH: /tmp/worker_ready
+    OMP_NUM_THREADS: ${OMP_NUM_THREADS:-2}
+    MKL_NUM_THREADS: ${MKL_NUM_THREADS:-2}
+    TZ: ${TZ:-Asia/Seoul}
+  volumes:
+    - model_weights:/models:ro
+  # 추론 임시 파일은 컨테이너 격리 tmpfs (호스트 디스크 보호 + Blue/Green 충돌 X)
+  tmpfs:
+    - /tmp:size=512m,uid=10001,gid=10001,mode=1777
+  depends_on:
+    redis:
+      condition: service_healthy
+  networks:
+    - vmd-internal
+  restart: unless-stopped
+  logging: *default-logging
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Services
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+  # ───────────── Edge / TLS termination ─────────────
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: vmd-nginx
+    environment:
+      - TZ=${TZ:-Asia/Seoul}
+    ports:
+      - "80:80"
+      - "443:443"
+    # Path-based routing 으로 호스트 EC2 의 Jenkins(systemd, :9090) 를 /jenkins/ 로 프록시.
+    # `host-gateway` 는 Docker 20.10+ 의 magic value — 호스트 IP 자동 해석 (Linux 도 지원).
+    # 컨테이너 안에서 host.docker.internal:9090 으로 도달 가능 → 10-server-https.conf 의
+    # `location /jenkins/ { proxy_pass http://host.docker.internal:9090/jenkins/; }` 가 사용.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ../nginx/conf/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ../nginx/conf/conf.d:/etc/nginx/conf.d:ro
+      - ../nginx/conf/snippets:/etc/nginx/snippets:ro
+      - ../nginx/conf/upstreams:/etc/nginx/upstreams:ro
+      - frontend_dist:/usr/share/nginx/html:ro
+      - django_static:/var/www/static:ro
+      - django_media:/var/www/media:ro
+      - /etc/letsencrypt:/etc/letsencrypt:ro
+      # Let's Encrypt HTTP-01 challenge webroot — certbot 이 호스트의 이 디렉터리에
+      # /.well-known/acme-challenge/<token> 파일을 쓰고, nginx 가 그대로 서빙.
+      - /var/www/certbot:/var/www/certbot:ro
+      # nginx Basic Auth 자격증명 파일 (htpasswd). 호스트 /etc/nginx/auth/ 에
+      # 직접 생성/관리 (git 미추적). 현재 사용처: /swagger/ (DoGo API doc 보호).
+      # 자격증명 회전: docker run --rm httpd:2.4-alpine htpasswd -nbB <user> <pass>
+      #               → 결과를 /etc/nginx/auth/.htpasswd-swagger 에 덮어쓰기.
+      - /etc/nginx/auth:/etc/nginx/auth:ro
+    tmpfs:
+      - /var/cache/nginx:size=128m
+      - /var/run
+    # 의도적으로 depends_on 미지정 — Nginx 는 upstream 부재 시 502 로 graceful 동작.
+    # 활성 색상이 blue/green 어느 쪽이든 시작 가능하도록 결합도 최소화.
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    networks:
+      - vmd-internal
+    restart: unless-stopped
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          cpus: "0.30"
+          memory: 256M
+        reservations:
+          memory: 64M
+
+  # ───────────── 볼륨 초기화 서비스 (one-shot) ─────────────
+  # 볼륨이 처음 생성될 때 소유권을 초기화하는 선언형 일회성 서비스입니다.
+  # CI에서 명시적으로 실행하거나 호스트 초기 프로비저닝 시 한 번 실행하면 됩니다
+  # (예: `docker compose run --rm init-volumes`). 기본적으로 자동 시작되지 않습니다.
+  init-volumes:
+    image: alpine:3.18
+    container_name: vmd-init-volumes
+    command: ["sh", "-c", "chown -R 10001:10001 /data || true"]
+    volumes:
+      - django_media:/data
+    restart: "no"
+    networks:
+      - vmd-internal
+
+  # ───────────── Frontend Builder (one-shot, profile=frontend) ─────────────
+  # 평소엔 기동 X. 배포 시 `--profile frontend run --rm frontend-builder` 로 1회 실행.
+  # 빌드 산출물(/dist)을 named volume(frontend_dist)에 복사 후 즉시 종료.
+  frontend-builder:
+    build:
+      context: ../../frontend
+      dockerfile: Dockerfile
+      target: export
+      args:
+        # API/WS 는 필수 (FE 가 BE/WebSocket 호출 못 하면 의미 없음)
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:?VITE_API_BASE_URL is required (build-arg)}
+        VITE_WS_BASE_URL: ${VITE_WS_BASE_URL:?VITE_WS_BASE_URL is required (build-arg)}
+        # CDN/Sentry 는 옵션 (도입 전엔 빈 값 허용 — Vite Dockerfile 도 default="")
+        VITE_CDN_BASE_URL: ${VITE_CDN_BASE_URL:-}
+        VITE_SENTRY_DSN: ${VITE_SENTRY_DSN:-}
+        VITE_GTM_ID: ${VITE_GTM_ID:-}
+    # Option A: 호스트 직접 빌드 — compose 가 vmd-prod-frontend-builder 로 자동 태깅.
+    container_name: vmd-frontend-builder
+    volumes:
+      - frontend_dist:/dist
+    profiles: ["frontend"]
+    networks:
+      - vmd-internal
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+
+  # ───────────── Django Blue (default active) ─────────────
+  # command 미지정 → entrypoint.sh 가 기본 gunicorn (sync, config.wsgi) 기동.
+  # 워커 수/타임아웃은 GUNICORN_WORKERS / GUNICORN_TIMEOUT 으로 주입.
+  django-blue:
+    <<: *django-common
+    # Option A: 호스트 직접 빌드 — compose 가 vmd-prod-django-blue 로 자동 태깅.
+    container_name: vmd-django-blue
+    expose:
+      - "8000"
+    volumes:
+      - django_media:/app/media
+    healthcheck:
+      # /healthz 미구현 → 임시로 /api/v1/hello 사용. BE 가 /healthz 추가하면 교체.
+      test:
+        [
+          "CMD",
+          "curl",
+          "-fsS",
+          "http://localhost:8000/api/v1/hello",
+          "-o",
+          "/dev/null",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    stop_grace_period: 60s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 2G
+        reservations:
+          memory: 512M
+
+  # ───────────── Django Green (standby, profile=green) ─────────────
+  django-green:
+    <<: *django-common
+    # Option A: 호스트 직접 빌드 — compose 가 vmd-prod-django-green 로 자동 태깅.
+    container_name: vmd-django-green
+    expose:
+      - "8000"
+    volumes:
+      - django_media:/app/media
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "curl",
+          "-fsS",
+          "http://localhost:8000/api/v1/hello",
+          "-o",
+          "/dev/null",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    stop_grace_period: 60s
+    profiles: ["green"]
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 2G
+        reservations:
+          memory: 512M
+
+  # ───────────── Celery Worker (단일 색상, light tasks) ─────────────
+  # 일반 비동기 작업(메일, 썸네일, 정합성 점검). Blue/Green 분리 X — 멱등성 보장.
+  # 마이그레이션 중간 상태 호환성은 task name 버저닝으로 해결 (plan §5.1 #6).
+  celery-worker:
+    <<: *django-common
+    # Option A: 호스트 직접 빌드 — compose 가 vmd-prod-celery-worker 로 자동 태깅.
+    # django-common anchor 의 build context (../../backend) 를 그대로 상속.
+    container_name: vmd-celery-worker
+    # entrypoint.sh 가 "$@" 를 exec → tini → celery worker 로 위임됨.
+    # Django celery app 은 backend/config/celery.py 의 Celery('config') 인스턴스.
+    command:
+      - "celery"
+      - "-A"
+      - "config"
+      - "worker"
+      - "-l"
+      - "INFO"
+      - "-Q"
+      - "default,celery"
+      - "-c"
+      - "2"
+      - "--prefetch-multiplier=4"
+      - "--max-tasks-per-child=200"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "celery -A config inspect ping -d celery@$$HOSTNAME >/dev/null 2>&1",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    stop_grace_period: 90s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 1G
+        reservations:
+          memory: 256M
+
+  # ───────────── AI Worker (single instance, rolling deploy) ─────────────
+  # Blue/Green 미사용 결정 근거:
+  #   - 단일 Lightsail xlarge(16GB) 에서 YOLO 모델(200~500MB) + PyTorch 상주 메모리를
+  #     두 벌 올리면 즉시 OOM 위험 (Blue+Green 동시 약 12GB 필요)
+  #   - AI Worker 는 Celery 큐 기반 비동기 소비자 — 짧은 downtime 중 task 는 큐에
+  #     쌓였다가 새 워커가 소비. acks_late=True + reject_on_worker_lost=True 로
+  #     in-flight 작업도 재큐됨 (plan §5.4.2)
+  # 배포 방식:
+  #   Stop-and-Start Rolling — `pull → stop → up -d`
+  #   Downtime: 모델 warmup 포함 약 30~90s (healthcheck.start_period 와 동일)
+  # 배포 트리거: infra/jenkins/Jenkinsfile-ai
+  ai-worker:
+    <<: *ai-common
+    # Option A: 호스트 직접 빌드 — compose 가 vmd-prod-ai-worker 로 자동 태깅.
+    container_name: vmd-ai-worker
+    command:
+      - "celery"
+      - "-A"
+      - "ai_app"
+      - "worker"
+      - "-Q"
+      - "ai"
+      - "-c"
+      - "2"
+      - "--prefetch-multiplier=1"
+      - "-Ofair"
+      - "--max-tasks-per-child=20"
+    healthcheck:
+      # ready flag 존재(=warmup 완료) AND celery 응답
+      test:
+        [
+          "CMD-SHELL",
+          "test -f /tmp/worker_ready && celery -A ai_app inspect ping -d celery@$$HOSTNAME >/dev/null 2>&1",
+        ]
+      interval: 30s
+      timeout: 15s
+      retries: 5
+      start_period: 90s
+    stop_grace_period: 120s
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 6G
+        reservations:
+          memory: 1G
+
+  # ───────────── PostgreSQL + PostGIS ─────────────
+  # ⚠️ BE 가 GeoDjango (django.contrib.gis) 를 사용하므로 일반 postgres 가 아닌
+  #     PostGIS 확장이 포함된 공식 이미지를 사용해야 한다. 일반 postgres 이미지로
+  #     기동하면 첫 마이그레이션의 'CREATE EXTENSION postgis' 단계에서 깨진다.
+  #     (cf. 루트 docker-compose.yml(개발용) 도 동일 이미지 사용 — 환경 정합성)
+  postgres:
+    image: postgis/postgis:16-3.4
+    container_name: vmd-postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB is required}
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER is required}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required (Tier-S)}
+      POSTGRES_INITDB_ARGS: "--encoding=UTF-8 --locale=C"
+      TZ: ${TZ:-Asia/Seoul}
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    expose:
+      - "5432" # 외부 노출 X (ports 미지정)
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      - vmd-internal
+    restart: unless-stopped
+    logging: *default-logging
+    shm_size: 256mb
+    # Lightsail xlarge(16GB) 기준 보수적 튜닝
+    command:
+      - "postgres"
+      - "-c"
+      - "max_connections=100"
+      - "-c"
+      - "shared_buffers=1GB"
+      - "-c"
+      - "effective_cache_size=2GB"
+      - "-c"
+      - "work_mem=16MB"
+      - "-c"
+      - "maintenance_work_mem=128MB"
+      - "-c"
+      - "log_min_duration_statement=500"
+      - "-c"
+      - "log_lock_waits=on"
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 3G
+        reservations:
+          memory: 1G
+
+  # ───────────── Redis (Cache + Celery Broker + Pub/Sub) ─────────────
+  redis:
+    image: redis:7-alpine
+    container_name: vmd-redis
+    command:
+      - "redis-server"
+      - "--requirepass"
+      - "${REDIS_PASSWORD:?REDIS_PASSWORD is required (Tier-S)}"
+      - "--appendonly"
+      - "yes"
+      - "--appendfsync"
+      - "everysec"
+      - "--maxmemory"
+      - "384mb"
+      - "--maxmemory-policy"
+      - "allkeys-lru"
+      - "--save"
+      - "300 100"
+      - "--protected-mode"
+      - "yes"
+    volumes:
+      - redis_data:/data
+    expose:
+      - "6379"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "redis-cli",
+          "-a",
+          "${REDIS_PASSWORD:?REDIS_PASSWORD is required}",
+          "--no-auth-warning",
+          "ping",
+        ]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    networks:
+      - vmd-internal
+    restart: unless-stopped
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          cpus: "0.30"
+          memory: 512M
+        reservations:
+          memory: 64M
+
+  # ───────────── Elasticsearch (single-node, X-Pack Basic) ─────────────
+  # 설계 근거: observability_elk_plan.md §D2
+  #   - heap 2GB (Xms=Xmx 동일 — JVM GC pause 회피)
+  #   - bootstrap.memory_lock=true + memlock unlimited → swap 진입 방지
+  #   - xpack.security 활성화 (basic auth 무료 범위)
+  #   - 호스트 vm.max_map_count=262144 선행 필수 (setup_swap.sh)
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.15.3
+    container_name: vmd-elasticsearch
+    environment:
+      cluster.name: vmd-logs
+      node.name: vmd-es-01
+      discovery.type: single-node
+      bootstrap.memory_lock: "true"
+      xpack.security.enabled: "true"
+      # internal network 만 통신, nginx 가 외부 TLS 종단 → ES 자체 SSL 불필요
+      xpack.security.transport.ssl.enabled: "false"
+      xpack.security.http.ssl.enabled: "false"
+      ELASTIC_PASSWORD: ${ELASTIC_PASSWORD:?ELASTIC_PASSWORD is required (Tier-S)}
+      ES_JAVA_OPTS: "-Xms2g -Xmx2g"
+      TZ: ${TZ:-Asia/Seoul}
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    volumes:
+      - es_data:/usr/share/elasticsearch/data
+    expose:
+      - "9200" # 외부 노출 X (nginx 도 ES 직접 안 씀, Kibana 만 통신)
+    healthcheck:
+      # green/yellow 둘 다 OK (single-node 라 replica=0 → 인덱스 status 가 yellow 가 정상)
+      test:
+        [
+          "CMD-SHELL",
+          'curl -fsS -u elastic:$$ELASTIC_PASSWORD http://localhost:9200/_cluster/health | grep -E ''"status":"(green|yellow)"'' >/dev/null || exit 1',
+        ]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+    networks:
+      - vmd-internal
+    restart: unless-stopped
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          cpus: "1.5"
+          memory: 3G
+        reservations:
+          memory: 1G
+
+  # ───────────── Kibana (Discover + Visualize UI) ─────────────
+  # 설계 근거: observability_elk_plan.md §D5
+  #   - basePath=/kibana — nginx path-based proxy 와 정합
+  #   - ES 접근은 service account token (`elastic/kibana`) 사용. ES 8.0+ 가
+  #     'elastic' 슈퍼유저 사용을 reject 하기 때문 (system indices 보호 정책).
+  #   - X-Pack 암호화 키 3개 모두 동일 값 (compose env 단순화)
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.15.3
+    container_name: vmd-kibana
+    environment:
+      SERVER_NAME: vmd-kibana
+      SERVER_HOST: 0.0.0.0
+      SERVER_PORT: 5601
+      SERVER_BASEPATH: /kibana
+      SERVER_REWRITEBASEPATH: "true"
+      SERVER_PUBLICBASEURL: https://do-goproject.com/kibana
+      ELASTICSEARCH_HOSTS: http://elasticsearch:9200
+      # ES 8.0+ 는 Kibana 가 'elastic' 슈퍼유저로 접근하면 reject — system indices
+      # 보호 정책. 따라서 service account token 사용 (USERNAME/PASSWORD 와 mutual exclusive).
+      # 발급 절차: prod.env.example 의 KIBANA_SERVICE_ACCOUNT_TOKEN 항목 참조.
+      ELASTICSEARCH_SERVICEACCOUNTTOKEN: ${KIBANA_SERVICE_ACCOUNT_TOKEN:?KIBANA_SERVICE_ACCOUNT_TOKEN is required (see prod.env.example)}
+      # 32+ chars 권장. Phase 2 에서 별도 키로 분리 가능
+      XPACK_ENCRYPTEDSAVEDOBJECTS_ENCRYPTIONKEY: ${KIBANA_ENCRYPTION_KEY:?KIBANA_ENCRYPTION_KEY is required (Tier-S, 32+ chars)}
+      XPACK_REPORTING_ENCRYPTIONKEY: ${KIBANA_ENCRYPTION_KEY}
+      XPACK_SECURITY_ENCRYPTIONKEY: ${KIBANA_ENCRYPTION_KEY}
+      LOGGING_ROOT_LEVEL: warn
+      TELEMETRY_ENABLED: "false"
+      TZ: ${TZ:-Asia/Seoul}
+    expose:
+      - "5601"
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    healthcheck:
+      # Kibana basePath 가 /kibana 라 status API 도 그 prefix 하위에 있음
+      test:
+        [
+          "CMD-SHELL",
+          'curl -fsS http://localhost:5601/kibana/api/status | grep -q ''"level":"available"'' || exit 1',
+        ]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 90s
+    networks:
+      - vmd-internal
+    restart: unless-stopped
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+        reservations:
+          memory: 256M
+
+  # ───────────── Filebeat (Docker autodiscover → Elasticsearch) ─────────────
+  # 설계 근거: observability_elk_plan.md §D4
+  #   - Docker 라벨/이름 기반 autodiscover — vmd-* 컨테이너만 수집
+  #   - docker.sock + /var/lib/docker/containers 둘 다 read-only mount
+  #   - root user 필요 (호스트 docker 디렉토리 권한)
+  #   - registry(offset) 영속화 — 재기동 시 중복 수집 방지
+  filebeat:
+    image: docker.elastic.co/beats/filebeat:8.15.3
+    container_name: vmd-filebeat
+    user: root # docker.sock + /var/lib/docker/containers 접근 위해 필요
+    environment:
+      ELASTIC_PASSWORD: ${ELASTIC_PASSWORD:?ELASTIC_PASSWORD is required}
+      TZ: ${TZ:-Asia/Seoul}
+    command:
+      - "filebeat"
+      - "-e" # stderr 로그 (Docker json-file 로테이션이 처리)
+      - "--strict.perms=false" # bind mount 권한 검사 완화
+    volumes:
+      - ../elk/filebeat/filebeat.yml:/usr/share/filebeat/filebeat.yml:ro
+      - ../elk/filebeat/ilm-policy.json:/usr/share/filebeat/ilm-policy.json:ro
+      - filebeat_data:/usr/share/filebeat/data
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    networks:
+      - vmd-internal
+    restart: unless-stopped
+    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 256M
+        reservations:
+          memory: 64M
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Volumes
+# ─────────────────────────────────────────────────────────────────────────────
+volumes:
+  # PostgreSQL 영속 데이터 (Phase 1: 컨테이너 볼륨, Phase 2: RDS 이전 예정)
+  pg_data:
+    name: vmd_pg_data
+
+  # Redis AOF / RDB
+  redis_data:
+    name: vmd_redis_data
+
+  # AI 모델 가중치 — 호스트 bind mount
+  # ⚠️ Phase 2 (ECS/EKS/Auto Scaling) 진입 시 본 패턴은 반드시
+  #     "S3 다운로드 + entrypoint 캐시" 로 마이그레이션해야 함.
+  #     (vmd_infra_plan.md §2.3 ⚠️ 박스 참조)
+  model_weights:
+    name: vmd_model_weights
+    driver: local
+    driver_opts:
+      type: none
+      device: /opt/vmd/models
+      o: bind
+
+  # frontend-builder 가 빌드 산출물을 export → nginx 가 read-only 마운트
+  frontend_dist:
+    name: vmd_frontend_dist
+
+  # Django collectstatic 산출물 (이미지 빌드 시점에 생성됨)
+  # 실제로는 컨테이너 내부 /app/staticfiles 에 박혀있으므로 본 볼륨 미사용 가능.
+  # 향후 Django admin 정적파일을 nginx 로 직접 서빙할 때 사용.
+  django_static:
+    name: vmd_django_static
+
+  # Django 미디어 파일 (사용자 업로드 등) — django-blue/green 가 생성, nginx 가 read-only 서빙
+  django_media:
+    name: vmd_django_media
+
+  # Elasticsearch 인덱스 / shards / translog. 데이터 손실 = 14일 retention 의 로그 손실
+  # (운영 critical X). 그래도 컨테이너 recreate 시 재인덱싱 비용 회피 위해 영속.
+  es_data:
+    name: vmd_es_data
+
+  # Filebeat registry — 컨테이너 로그의 read offset 추적. 재기동 시 중복/누락 방지.
+  filebeat_data:
+    name: vmd_filebeat_data
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Networks
+# ─────────────────────────────────────────────────────────────────────────────
+networks:
+  # 단일 internal bridge — 외부 노출은 nginx 의 80/443 만
+  vmd-internal:
+    name: vmd-internal
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24

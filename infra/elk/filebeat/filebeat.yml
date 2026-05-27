@@ -1,0 +1,186 @@
+# =============================================================================
+#  Filebeat — VMD 컨테이너 로그 수집 → Elasticsearch 적재
+# -----------------------------------------------------------------------------
+#  설계 근거: infra/.ai/plan/observability_elk_plan.md §D4
+#
+#  수집 대상: vmd-* 컨테이너 (Filebeat 자기 자신은 제외)
+#  적재처:    elasticsearch (compose 의 vmd-elasticsearch 컨테이너)
+#  ILM:       /usr/share/filebeat/ilm-policy.json (rollover 1d/1gb, retention 7d)
+#  인덱스:    vmd-logs-{now/d}-000001 (rollover_alias 'vmd-logs')
+# =============================================================================
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Autodiscover — Docker 컨테이너 자동 감지
+# ─────────────────────────────────────────────────────────────────────────────
+# 컨테이너 라이프사이클을 따라 동적으로 input 추가/제거.
+# vmd-* 컨테이너만 수집, 자기 자신(vmd-filebeat) 은 명시적 제외.
+filebeat.autodiscover:
+  providers:
+    - type: docker
+      templates:
+        - condition:
+            and:
+              - regexp:
+                  container.name: "^vmd-"
+              - not:
+                  equals:
+                    container.name: "vmd-filebeat"
+              # Task 4 (2026-05-12) — vmd-redis 제외. Redis 7.4 notice 레벨의 routine
+              # 로그 (Background saving, DB saved 등) 가 24h 의 약 10% 차지 = 노이즈.
+              # Redis 장애 분석은 `docker logs vmd-redis` 로 직접 본다 (low value).
+              - not:
+                  equals:
+                    container.name: "vmd-redis"
+          config:
+            - type: container
+              paths:
+                - /var/lib/docker/containers/${data.container.id}/*.log
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Processors — 메타데이터 보강 + 앱별 dissect (Phase 2.1 + 2.4)
+# ─────────────────────────────────────────────────────────────────────────────
+# 1) Docker / host 메타 — 검색 시 컨테이너별 필터링
+# 2) nginx access log dissect — status / path / duration 분리 (대시보드 5xx 비율)
+# 3) Django gunicorn error log dissect — level / module 분리 (에러 빈도 패널)
+# 4) Celery task 완료 로그 dissect — task name / duration 분리 (latency p50/p95/p99)
+#
+# 동작:
+#   - dissect 가 패턴에 맞으면 target_prefix 하위 필드로 분리 인덱싱
+#   - 패턴 불일치 시 message 그대로 보존 (ignore_failure: true) — fail-loud 안 함
+#   - Phase 2 plan §1.1 패턴 기반. 운영 데이터 보고 후 조정 가능 (별도 commit).
+#
+# 패턴 출처:
+#   - nginx: infra/nginx/conf/nginx.conf 의 log_format main 정의 그대로 미러
+#     '$remote_addr - $remote_user [$time_local] "$request" $status $body_bytes_sent '
+#     '"$http_referer" "$http_user_agent" rt=$request_time uct="$upstream_connect_time" urt="$upstream_response_time"'
+#   - Django: gunicorn error log 표준 형식 [%(asctime)s] [%(levelname)s] [%(name)s] msg
+#   - Celery: ultralytics + ai_app/tasks.py 의 task succeeded 로그 — 운영 후 정확화 필요
+processors:
+  - add_docker_metadata: ~
+  - add_host_metadata:
+      netinfo.enabled: false
+
+  # ── nginx access log → nginx.{client_ip,user,ts,method,path,proto,status,bytes,referer,ua,rt,uct,urt} ──
+  - dissect:
+      when:
+        contains:
+          container.name: "vmd-nginx"
+      tokenizer: '%{client_ip} - %{user} [%{ts}] "%{method} %{path} %{proto}" %{status} %{bytes} "%{referer}" "%{ua}" rt=%{rt} uct="%{uct}" urt="%{urt}"'
+      field: "message"
+      target_prefix: "nginx"
+      ignore_failure: true
+  # nginx.status / nginx.bytes / nginx.rt 를 숫자로 변환 (ES 인덱싱 시 long/double).
+  # convert 실패는 무시 (예: error_log 라인은 status 자체가 없음).
+  - convert:
+      when:
+        contains:
+          container.name: "vmd-nginx"
+      fields:
+        - { from: "nginx.status", type: "long" }
+        - { from: "nginx.bytes",  type: "long" }
+        - { from: "nginx.rt",     type: "double" }
+        - { from: "nginx.urt",    type: "double" }
+      ignore_missing: true
+      fail_on_error: false
+
+  # ── Django + gunicorn 통합 elk format → django.{ts,level,name,msg} ──
+  # 운영 형식 (backend/config/settings.py LOGGING 의 elk formatter):
+  #   "[2026-05-12 10:30:15 +0900] [INFO] [django.request] login successful"
+  #   → [ts] [level] [name] msg
+  # gunicorn 의 워커 로그도 settings.py 의 gunicorn.{error,access} 로거 흡수로 같은 elk format 사용.
+  # 예외: gunicorn 마스터 부팅 라인 (Starting/Listening) 은 Django 로드 이전이라 자체 형식
+  #       `[ts] [pid] [level] msg` 유지 — 배포 당 ~5라인 정도, dissect 시 level/name 자리 어긋남.
+  #       빈도 매우 낮아 ignore_failure 만으로 raw message 보존 (필드 일부 오염은 감수).
+  - dissect:
+      when:
+        or:
+          - contains: { container.name: "vmd-django-blue" }
+          - contains: { container.name: "vmd-django-green" }
+      tokenizer: "[%{ts}] [%{level}] [%{name}] %{msg}"
+      field: "message"
+      target_prefix: "django"
+      ignore_failure: true
+
+  # ── Celery / AI worker task 완료 로그 → celery.{task,task_id,duration,result_summary} ──
+  # 실제 운영 형식 (2026-05-12 확인):
+  #   [2026-05-12 08:32:49,086: INFO/ForkPoolWorker-2] Task users.tasks.send_verification_email[1205e99c-...] succeeded in 2.411s: None
+  # 이전 패턴은 prefix `[ts: LEVEL/Proc]` 를 매칭 못 해서 succeeded 라인 0건 캡쳐.
+  # prefix 의 3개 필드는 `?` 로 throwaway (top-level 오염 방지, 의미는 docker.* 메타와 중복).
+  - dissect:
+      when:
+        or:
+          - contains: { container.name: "vmd-celery-worker" }
+          - contains: { container.name: "vmd-ai-worker" }
+      tokenizer: "[%{?celery_ts}: %{?celery_level}/%{?celery_worker}] Task %{celery.task}[%{celery.task_id}] succeeded in %{celery.duration}s: %{celery.result_summary}"
+      field: "message"
+      ignore_failure: true
+  # celery.duration 을 double 로 변환 → Kibana 에서 percentile 계산 가능.
+  - convert:
+      when:
+        or:
+          - contains: { container.name: "vmd-celery-worker" }
+          - contains: { container.name: "vmd-ai-worker" }
+      fields:
+        - { from: "celery.duration", type: "double" }
+      ignore_missing: true
+      fail_on_error: false
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Output — Elasticsearch 단일 노드 (data stream `vmd-logs`)
+# ─────────────────────────────────────────────────────────────────────────────
+# index 미명시 시 Filebeat 8.x default = `filebeat-{version}` 으로 적재됨.
+# 우리 setup.template.name="vmd-logs" 는 composable template 등록만 처리하므로
+# output 의 라우팅은 별개로 명시 필요. data stream 모드라 events 가 자동으로
+# `vmd-logs` data stream 의 backing index `.ds-vmd-logs-*` 로 적재됨.
+output.elasticsearch:
+  hosts: ["http://elasticsearch:9200"]
+  username: "elastic"
+  password: "${ELASTIC_PASSWORD}"
+  index: "vmd-logs"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ILM — 인덱스 라이프사이클 (rollover + 7일 retention)
+# ─────────────────────────────────────────────────────────────────────────────
+# Filebeat 8.x 는 default 로 data stream 사용 → backing index `.ds-vmd-logs-*`
+# 가 ILM rollover 사이클로 자동 관리됨.
+# rollover_alias / pattern 은 8.x 에서 legacy 모드 잔재이며 data stream 과 충돌
+# (ES 가 "no matching index template found for data stream" 400 으로 거부) →
+# 모두 제거. policy_file 의 ILM 정책은 composable template 의 lifecycle 설정으로
+# Filebeat 가 자동 연결.
+setup.ilm:
+  enabled: true
+  policy_name: "vmd-logs-policy"
+  policy_file: /usr/share/filebeat/ilm-policy.json
+  overwrite: false
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Index template — composable (8.x 권장) + data stream 자동 생성
+# ─────────────────────────────────────────────────────────────────────────────
+# type: index → composable index template (`_index_template/<name>`) 등록.
+#   - data stream `vmd-logs` 가 이 template 을 인덱스 템플릿으로 사용
+#   - backing index 는 `.ds-vmd-logs-*` 형태 (ILM 이 자동 rollover)
+#   - Kibana 검색 시 `vmd-logs` data stream 으로 직접 (또는 `.ds-vmd-logs-*` 패턴)
+# pattern 은 data stream 이름과 일치 ("vmd-logs") — composable 의 index_patterns 로 매핑.
+setup.template:
+  enabled: true
+  type: index
+  name: "vmd-logs"
+  pattern: "vmd-logs"
+  overwrite: true
+  settings:
+    index.number_of_shards: 1
+    index.number_of_replicas: 0
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Filebeat 자체 로깅 — stderr (Docker json-file 로테이션이 처리)
+# ─────────────────────────────────────────────────────────────────────────────
+logging:
+  level: info
+  to_files: false
+  to_stderr: true
+
+# Kibana setup 비활성 — Phase 2 의 대시보드 import 는 별도 절차로
+setup.kibana.enabled: false
+
+# Filebeat 자기 모니터링 비활성 (X-Pack monitoring) — single-node 라 불필요
+monitoring.enabled: false

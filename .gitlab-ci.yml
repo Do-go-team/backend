@@ -1,0 +1,365 @@
+# =============================================================================
+#  .gitlab-ci.yml — VMD 3D Layout Service
+# -----------------------------------------------------------------------------
+#  설계 근거: infra/.ai/plan/vmd_infra_plan.md §4.1 ~ §4.2
+#             operations_activation_plan.md §1.4 (Option A 적용)
+#
+#  Stages:
+#    lint             : Path-gated (변경 영역만) lint — fe/be/ai 분리
+#    test             : Path-gated unit tests (FE: vitest, BE: pytest + PostgreSQL service)
+#    trigger-deploy   : dev 브랜치에서 영역별로 Jenkins 호출 (release 브랜치)
+#
+#  Path 게이팅:
+#    frontend/**/*  → lint:fe + test:fe-unit + trigger:jenkins-fe
+#    backend/**/*   → lint:be + test:be-unit + trigger:jenkins-be
+#    ai-worker/**/* → lint:ai (test 잡 없음, ai-worker 는 pytest 미작성) + trigger:jenkins-ai
+#    infra/...      → lint/test 없이 trigger:jenkins-infra (해당 path 만 매칭 시)
+#  → 무관한 영역의 PR 에서는 lint/test 가 돌지 않음 (노이즈 차단 + CI 시간 절감)
+#
+#  Option A (no registry):
+#    - SSAFY GitLab Container Registry 정책상 미가용
+#    - Docker 이미지 빌드는 Jenkins 호스트(EC2)가 직접 수행
+#    - GitLab CI 는 lint/test 게이트 + Jenkins 트리거만 담당
+# =============================================================================
+
+stages:
+  - lint
+  - test
+  - trigger-deploy
+
+variables:
+  FF_USE_FASTZIP: "true"                # GitLab artifact 압축 가속
+  GIT_DEPTH: "10"                       # shallow clone
+
+default:
+  interruptible: true                   # 새 push 들어오면 이전 pipeline 자동 취소
+  tags: [docker]                        # GitLab Runner 태그
+
+# -----------------------------------------------------------------------------
+# Shared fragments
+# -----------------------------------------------------------------------------
+# FE 가 pnpm 채택 (packageManager 필드로 pnpm@10.30.3 고정).
+# - key: pnpm-lock.yaml 해시 기반 (lock 변경 시 캐시 무효화)
+# - path: pnpm 의 로컬 store 디렉토리 (frontend/.pnpm-store)
+.pnpm-cache: &pnpm-cache
+  key:
+    files: [frontend/pnpm-lock.yaml]
+  paths:
+    - frontend/.pnpm-store
+  policy: pull-push
+
+.pip-cache: &pip-cache
+  key:
+    files: [backend/requirements.txt]
+  paths:
+    - backend/.pip-cache
+  policy: pull-push
+
+
+# =============================================================================
+# 1. LINT  (stage: lint)
+# =============================================================================
+lint:fe:
+  stage: lint
+  image: node:20-alpine
+  cache:
+    <<: *pnpm-cache
+  before_script:
+    - cd frontend
+    # corepack 으로 packageManager 필드(pnpm@X.Y.Z) 그대로 활성화 (버전 드리프트 차단)
+    - corepack enable
+    # store 위치를 캐시 path 와 일치시켜 GitLab cache 적중률 ↑
+    - pnpm config set store-dir .pnpm-store
+    - pnpm install --frozen-lockfile --prefer-offline
+  script:
+    # FE package.json scripts: { "lint": "biome check && eslint ." }
+    - pnpm run lint
+    # tsr generate 로 routeTree.gen.ts 생성 후 타입 검사 (gitignore 파일이라 CI 에 없음).
+    - pnpm run typecheck
+  rules:
+    # 활성화 조건 (모두 충족):
+    #   1) FE 부트스트랩 완료 (pnpm-lock.yaml 존재) — BE/AI/Infra 만 건드린 PR 빨강 차단
+    #   2) frontend/ 경로 변경 — 다른 영역 PR 에서는 lint:fe 안 돌게 path-gating
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      exists: [frontend/pnpm-lock.yaml]
+      changes:
+        - frontend/**/*
+    - if: $CI_COMMIT_BRANCH
+      exists: [frontend/pnpm-lock.yaml]
+      changes:
+        - frontend/**/*
+
+lint:be:
+  stage: lint
+  image: python:3.12-slim
+  cache:
+    <<: *pip-cache
+  before_script:
+    - cd backend
+    - pip install --cache-dir .pip-cache --disable-pip-version-check ruff mypy
+  script:
+    - ruff check .
+    - ruff format --check .
+    # mypy 는 settings 의존 모듈에서 실패할 수 있어 non-blocking 으로 시작 (팀 정책에 맞춰 조정)
+    - mypy . || true
+  rules:
+    # backend/ 변경 시만 활성화 — FE/AI/Infra PR 의 BE lint 노이즈 차단.
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      changes:
+        - backend/**/*
+    - if: $CI_COMMIT_BRANCH
+      changes:
+        - backend/**/*
+
+lint:ai:
+  stage: lint
+  image: python:3.12-slim
+  cache:
+    <<: *pip-cache
+  before_script:
+    - cd ai-worker
+    - pip install --cache-dir .pip-cache --disable-pip-version-check ruff
+  script:
+    - ruff check .
+    - ruff format --check .
+  rules:
+    # ai-worker/ 변경 시만 활성화. ai-worker 는 pytest 미작성 → test:ai-unit 잡 없음.
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      changes:
+        - ai-worker/**/*
+    - if: $CI_COMMIT_BRANCH
+      changes:
+        - ai-worker/**/*
+
+
+# =============================================================================
+# 2. TEST  (stage: test)
+# =============================================================================
+test:fe-unit:
+  stage: test
+  image: node:20-alpine
+  cache:
+    <<: *pnpm-cache
+  before_script:
+    - cd frontend
+    - corepack enable
+    - pnpm config set store-dir .pnpm-store
+    - pnpm install --frozen-lockfile --prefer-offline
+  script:
+    # FE 가 vitest 도입 시 package.json 에 "test": "vitest run" 스크립트 추가 → 자동 활성화.
+    - pnpm run test -- --coverage --reporter=default --reporter=junit --outputFile=report.xml
+  coverage: '/^Statements\s*:\s*([0-9.]+)%/'
+  artifacts:
+    when: always
+    reports:
+      junit: frontend/report.xml
+      coverage_report:
+        coverage_format: cobertura
+        path: frontend/coverage/cobertura-coverage.xml
+    paths: [frontend/coverage]
+    expire_in: 1 week
+  rules:
+    # 활성화 조건 (모두 충족):
+    #   1) FE 부트스트랩 완료 (pnpm-lock.yaml 존재)
+    #   2) vitest 도입 완료 (vitest.config.* 존재) — 미충족이면 잡 제외
+    #   3) frontend/ 경로 변경 — 다른 영역 PR 에서는 안 돔
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      exists:
+        - frontend/pnpm-lock.yaml
+        - frontend/vitest.config.{ts,mts,js,mjs}
+      changes:
+        - frontend/**/*
+    - if: $CI_COMMIT_BRANCH
+      exists:
+        - frontend/pnpm-lock.yaml
+        - frontend/vitest.config.{ts,mts,js,mjs}
+      changes:
+        - frontend/**/*
+
+test:be-unit:
+  stage: test
+  image: python:3.12-slim
+  services:
+    - name: postgis/postgis:16-3.4-alpine
+      alias: postgres
+    - name: redis:7-alpine
+      alias: redis
+  variables:
+    POSTGRES_DB: vmd_test
+    POSTGRES_USER: vmd_test
+    POSTGRES_PASSWORD: vmd_test
+    POSTGRES_HOST: postgres
+    POSTGRES_HOST_AUTH_METHOD: trust
+    CELERY_BROKER_URL: redis://redis:6379/0
+    CELERY_RESULT_BACKEND: redis://redis:6379/1
+    REDIS_CACHE_URL: redis://redis:6379/2
+    DATABASE_URL: postgres://vmd_test:vmd_test@postgres:5432/vmd_test
+    DJANGO_SETTINGS_MODULE: config.settings
+    DJANGO_SECRET_KEY: "ci-test-secret-do-not-use-in-prod"
+    DJANGO_DEBUG: "True"
+    DJANGO_ALLOWED_HOSTS: "*"
+  cache:
+    <<: *pip-cache
+  before_script:
+    - apt-get update -qq && apt-get install -y --no-install-recommends gdal-bin libgdal-dev gcc
+    - cd backend
+    - pip install --cache-dir .pip-cache --disable-pip-version-check -r requirements.txt
+    - pip install --cache-dir .pip-cache --disable-pip-version-check pytest pytest-django pytest-cov
+  script:
+    - pytest
+        --cov=.
+        --cov-report=xml:coverage.xml
+        --cov-report=term
+        --junitxml=report.xml
+        -p no:cacheprovider
+  coverage: '/TOTAL.*\s+(\d+%)$/'
+  artifacts:
+    when: always
+    reports:
+      junit: backend/report.xml
+      coverage_report:
+        coverage_format: cobertura
+        path: backend/coverage.xml
+    expire_in: 1 week
+  rules:
+    # backend/ 변경 시만 활성화 — FE/AI/Infra PR 의 BE 테스트 노이즈 차단.
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      changes:
+        - backend/**/*
+    - if: $CI_COMMIT_BRANCH
+      changes:
+        - backend/**/*
+
+
+# =============================================================================
+# 3. TRIGGER-DEPLOY  (stage: trigger-deploy)
+# -----------------------------------------------------------------------------
+#   Option A 기준: dev 브랜치에서 경로별 수동 버튼으로 Jenkins 잡 kick-off.
+#   이미지 빌드는 Jenkins 가 호스트에서 직접 수행 (Jenkinsfile-{be,fe} 참조).
+#
+#   rules:changes 로 경로 기반 gating:
+#       frontend/**/*               → trigger:jenkins-fe    → Jenkinsfile-fe    (Export)
+#       backend/**/*                → trigger:jenkins-be    → Jenkinsfile-be    (Blue/Green)
+#       ai-worker/**/*              → trigger:jenkins-ai    → Jenkinsfile-ai    (Stop-and-Start)
+#       infra/compose/**/*          \
+#       infra/nginx/**/*             → trigger:jenkins-infra → Jenkinsfile-infra (compose up -d)
+#       infra/elk/**/*               /                          + filebeat restart (Phase 2)
+#       infra/jenkins/Jenkinsfile-infra
+#
+#   브랜치 동작:
+#       FE    : fe  브랜치 → when: on_success   (Level 2 자동 배포 — push → 자동)
+#       BE    : dev 브랜치 → when: on_success   (Level 2 자동 배포 — push → 자동)
+#       AI    : dev 브랜치 → when: on_success   (Level 2 자동 배포 — push → 자동)
+#       INFRA : dev 브랜치 → when: on_success   (Level 2 자동 배포 — push → 자동)
+#       그 외 브랜치 → 트리거 없음 (A1 prod-only)
+#
+#   Jenkins 측 요구사항:
+#     - Job 이름: vmd-deploy-be / vmd-deploy-fe / vmd-deploy-ai / vmd-deploy-infra
+#     - Pipeline: infra/jenkins/Jenkinsfile-{be,fe,ai,infra}
+#     - Parameters: GIT_BRANCH (Jenkinsfile 이 SHA 를 git 에서 해석)
+#
+#   필요한 CI/CD variables (Settings → CI/CD → Variables, Protected + Masked):
+#     JENKINS_URL, JENKINS_USER, JENKINS_TOKEN
+# =============================================================================
+.trigger-base:
+  stage: trigger-deploy
+  image: curlimages/curl:8.8.0
+  variables:
+    GIT_STRATEGY: none                  # 소스 체크아웃 불필요 (curl 만 호출)
+
+# ─── helper: Jenkins buildWithParameters POST ────────────────────────────────
+# 호출 측은 JOB_NAME 을 export 후 사용.
+.post-to-jenkins: &post-to-jenkins |
+  echo "Triggering Jenkins: job=$JOB_NAME  branch=$CI_COMMIT_BRANCH"
+  HTTP_CODE=$(curl -sS -o /tmp/jenkins.out -w '%{http_code}' \
+    -u "$JENKINS_USER:$JENKINS_TOKEN" \
+    -X POST "$JENKINS_URL/job/$JOB_NAME/buildWithParameters" \
+    --data-urlencode "GIT_BRANCH=$CI_COMMIT_BRANCH")
+  echo "Jenkins HTTP $HTTP_CODE"
+  cat /tmp/jenkins.out || true
+  # 201 Created (Jenkins queue 진입) 가 정상
+  case "$HTTP_CODE" in 2*) exit 0 ;; *) exit 1 ;; esac
+
+
+# ─── FE: frontend/**/* 변경 시 ───────────────────────────────────────────────
+trigger:jenkins-fe:
+  extends: .trigger-base
+  variables:
+    JOB_NAME: "vmd-deploy-fe"
+  script:
+    - *post-to-jenkins
+  rules:
+    # FE 는 mocking 으로 BE 와 독립 배포 → fe 브랜치 기준.
+    # BE 통합 후에는 "dev" 로 전환 (Jenkinsfile-fe defaultValue 도 함께 갱신).
+    #
+    # Level 2 자동 배포: fe 의 frontend/ 변경 → lint+test 통과 → 자동 Jenkins 발사.
+    # FE 는 dist volume export 패턴 — DB migration 없음, 자산 교체 원자적, BE Blue/Green
+    # 보다 위험 표면적이 작아 BE 와 동일한 안전망(mm 알림 + 외부 모니터)으로 자동화 가능.
+    - if: $CI_COMMIT_BRANCH == "fe"
+      exists: [frontend/pnpm-lock.yaml]
+      changes:
+        - frontend/**/*
+      when: on_success
+      allow_failure: false
+
+
+# ─── BE: backend/**/* 변경 시 ────────────────────────────────────────────────
+trigger:jenkins-be:
+  extends: .trigger-base
+  variables:
+    JOB_NAME: "vmd-deploy-be"
+  script:
+    - *post-to-jenkins
+  rules:
+    # Level 2 자동 배포: dev 의 backend/ 변경 → lint+test 통과 → 자동 Jenkins 발사.
+    # 안전망: Jenkinsfile-be 의 stage F (3분 auto-confirm) + post.failure 자동 cleanup
+    #         + Mattermost 알림 + UptimeRobot 외부 모니터링.
+    - if: $CI_COMMIT_BRANCH == "dev"
+      changes:
+        - backend/**/*
+      when: on_success
+      allow_failure: false
+
+
+# ─── AI: ai-worker/**/* 변경 시 ──────────────────────────────────────────────
+# Level 2 자동 배포: dev 의 ai-worker/ 변경 → lint+test 통과 → 자동 Jenkins 발사.
+# 안전망: Stop-and-Start 롤링 (in-flight task 는 Redis 큐에서 acks_late 로 보존)
+#         + Jenkinsfile-ai stage E healthcheck wait (3분, 모델 warmup 포함)
+#         + Mattermost 알림.
+trigger:jenkins-ai:
+  extends: .trigger-base
+  variables:
+    JOB_NAME: "vmd-deploy-ai"
+  script:
+    - *post-to-jenkins
+  rules:
+    - if: $CI_COMMIT_BRANCH == "dev"
+      changes:
+        - ai-worker/**/*
+      when: on_success
+      allow_failure: false
+
+
+# ─── INFRA: infra/compose, infra/nginx, Jenkinsfile-infra 변경 시 ────────────
+# Level 2 자동 배포: dev 의 인프라 변경 → lint+test 통과 → 자동 Jenkins 발사.
+# 책임 영역: nginx + postgres + redis (Jenkinsfile-infra INFRA_SERVICES).
+# 안전망: compose up -d 멱등 + nginx -t/-s reload + healthcheck 폴링(90s) + 외부
+#         /api/v1/hello smoke + 메모리 여유 점검. BE/AI/FE 컨테이너는 인자 격리로
+#         절대 손대지 않음 (Jenkinsfile-infra §5.2).
+# 자동 롤백 없음 (인프라 변경은 "추가" 가 많아 자동 down 이 더 위험) — 실패 시
+#   Mattermost 알림 → 운영자가 git revert 또는 SSH 직접 개입.
+trigger:jenkins-infra:
+  extends: .trigger-base
+  variables:
+    JOB_NAME: "vmd-deploy-infra"
+  script:
+    - *post-to-jenkins
+  rules:
+    - if: $CI_COMMIT_BRANCH == "dev"
+      changes:
+        - infra/compose/**/*
+        - infra/nginx/**/*
+        - infra/elk/**/*
+        - infra/jenkins/Jenkinsfile-infra
+      when: on_success
+      allow_failure: false

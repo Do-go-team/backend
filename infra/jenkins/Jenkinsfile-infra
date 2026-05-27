@@ -1,0 +1,392 @@
+// =============================================================================
+//  infra/jenkins/Jenkinsfile-infra — VMD Infra-only Deploy
+// -----------------------------------------------------------------------------
+//  설계 근거: infra/.ai/plan/infra_deploy_job_plan.md
+//
+//  배포 모델: 인프라 책임 영역 (nginx + postgres + redis [+ 향후 ELK]) 만 적용.
+//             compose 의 변경 감지에 위임 — `up -d <고정 인자 리스트>` 한 줄.
+//
+//  파라미터:
+//    GIT_BRANCH   배포할 브랜치 (default: dev — release 브랜치)
+//    SKIP_SMOKE   배포 후 외부 헬스 체크 건너뛰기 (default: false)
+//
+//  실행 흐름:
+//    A)  /opt/vmd/source 를 origin/$GIT_BRANCH 에 hard reset
+//    A2) Jenkins Credentials 의 vmd-prod-env → disk 복사
+//    A3) docker compose config -q 로 yaml 검증
+//    A4) nginx -t 로 nginx 설정 검증 (컨테이너 떠 있을 때만)
+//    B)  docker compose up -d $INFRA_SERVICES (멱등 + 변경 감지)
+//    B2) nginx -s reload (idempotent, 컨테이너 떠 있을 때만)
+//    C)  영향 컨테이너 healthcheck 폴링 (max 90s)
+//    D)  외부 헬스 / 메모리 smoke
+//
+//  자동 롤백 없음 (plan §7.1):
+//    인프라 변경은 "추가" 가 많아 자동 down 이 더 위험.
+//    실패 시 Mattermost 알림 → 운영자가 git revert 또는 SSH 직접 개입.
+//
+//  책임 영역 격리 (plan §5.2):
+//    - up -d 인자에 BE/AI/FE 서비스(django-blue/green, celery-worker, ai-worker,
+//      frontend-builder)는 절대 들어가지 않음 → 본 Job 이 침범 불가.
+//    - --profile green / --profile frontend 본 Job 에서 사용 안 함.
+//    - --force-recreate / --build / down / rm 등 파괴적 옵션 일괄 금지.
+//
+//  Jenkins 전제:
+//    - jenkins 사용자가 docker 그룹
+//    - /opt/vmd/source 가 jenkins 쓰기 가능
+//    - Credentials: vmd-prod-env (Secret file), mm-webhook-deploy (Secret text)
+// =============================================================================
+
+pipeline {
+    agent any
+
+    parameters {
+        string(
+            name: 'GIT_BRANCH',
+            defaultValue: 'dev',
+            description: '배포할 브랜치 (default: dev)'
+        )
+        booleanParam(
+            name: 'SKIP_SMOKE',
+            defaultValue: false,
+            description: '외부 /api/v1/hello smoke check 건너뛰기'
+        )
+    }
+
+    options {
+        timestamps()
+        ansiColor('xterm')
+        disableConcurrentBuilds()
+        timeout(time: 15, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '30'))
+    }
+
+    environment {
+        // Git plugin 이 SCM checkout 단계에서 GIT_BRANCH=origin/<branch> 로 자동 set
+        // → parameter 의 GIT_BRANCH 를 명시 override 안 하면 'git fetch origin origin/dev' 가 됨
+        GIT_BRANCH      = "${params.GIT_BRANCH}"
+        SOURCE_DIR      = '/opt/vmd/source'
+        BASE_URL        = 'https://do-goproject.com'
+
+        // 본 Job 이 책임지는 서비스 (compose up -d 의 인자로 그대로 들어감).
+        // 이 리스트에 없는 서비스는 본 Job 이 절대 손대지 않음.
+        // observability_elk_plan.md 도입 직후: ELK 3개 서비스 포함.
+        INFRA_SERVICES  = 'nginx postgres redis elasticsearch kibana filebeat'
+
+        NGINX_CONTAINER = 'vmd-nginx'
+        HEALTH_WAIT_SEC = '90'
+    }
+
+    stages {
+
+        // ══════════════ A. Sync ══════════════
+        stage('A. Sync canonical source') {
+            steps {
+                sh '''#!/usr/bin/env bash
+                    set -euo pipefail
+                    cd "$SOURCE_DIR"
+                    git fetch --quiet origin "$GIT_BRANCH"
+                    git checkout --quiet "$GIT_BRANCH"
+                    git reset --hard "origin/$GIT_BRANCH"
+                    git rev-parse --short HEAD > .deploy_sha
+                    echo "[deploy] $SOURCE_DIR @ $(cat .deploy_sha) (branch $GIT_BRANCH)"
+                '''
+                script {
+                    env.NEW_SHA = sh(
+                        returnStdout: true,
+                        script: 'cat "$SOURCE_DIR/.deploy_sha"'
+                    ).trim()
+                    echo """
+                    ═══════════════ VMD Infra Deploy ═══════════════
+                      branch    : ${params.GIT_BRANCH}
+                      sha       : ${env.NEW_SHA}
+                      services  : ${env.INFRA_SERVICES}
+                      strategy  : compose up -d (idempotent)
+                      build     : ${env.BUILD_URL}
+                    ════════════════════════════════════════════════
+                    """.stripIndent()
+                }
+            }
+        }
+
+        // ══════════════ A2. Sync prod env (Jenkins Credentials → disk) ══════════════
+        // BE/AI Job 과 동일 패턴 — vmd-prod-env Secret file 이 단일 진실.
+        stage('A2. Sync prod env from Jenkins Credentials') {
+            steps {
+                withCredentials([file(credentialsId: 'vmd-prod-env', variable: 'PROD_ENV_FILE')]) {
+                    sh '''#!/usr/bin/env bash
+                        set -euo pipefail
+                        install -m 600 "$PROD_ENV_FILE" "$SOURCE_DIR/infra/env/prod.env"
+                        echo "[deploy] synced prod.env from Jenkins Credentials (vmd-prod-env)"
+                    '''
+                }
+            }
+        }
+
+        // ══════════════ A3. Validate compose yaml ══════════════
+        // 변경 적용 전에 yaml 파싱 + ${VAR:?} 필수 키 누락 등을 1차 검증.
+        // 실패 시 즉시 종료 — 어느 컨테이너도 건드리지 않음.
+        stage('A3. Validate compose config') {
+            steps {
+                sh '''#!/usr/bin/env bash
+                    set -euo pipefail
+                    cd "$SOURCE_DIR/infra/compose"
+                    docker compose --env-file ../env/prod.env -f docker-compose.prod.yml \
+                      config -q
+                    echo "[validate] compose yaml OK"
+                '''
+            }
+        }
+
+        // ══════════════ A4. Validate nginx config (if running) ══════════════
+        // nginx 컨테이너가 떠 있을 때만 검증. 첫 배포 (컨테이너 부재) 는 skip —
+        // 이 경우 stage B 의 compose up 이 신규 기동하면서 자체 검증함.
+        // 실패 시 stage B 진입 안 함 (기존 config 유지).
+        stage('A4. Validate nginx config') {
+            steps {
+                sh '''#!/usr/bin/env bash
+                    set -euo pipefail
+                    if docker ps --format '{{.Names}}' | grep -qx "$NGINX_CONTAINER"; then
+                      docker exec "$NGINX_CONTAINER" nginx -t
+                      echo "[validate] nginx config OK"
+                    else
+                      echo "[validate] $NGINX_CONTAINER not running — skip (first deploy)"
+                    fi
+                '''
+            }
+        }
+
+        // ══════════════ B. Apply ══════════════
+        // compose up -d 는 멱등 + 변경 감지가 내장.
+        //   - 변경 없는 서비스: no-op
+        //   - 새 서비스: 신규 기동
+        //   - 변경된 서비스: 재기동 (graceful — SIGTERM → stop_grace_period → SIGKILL)
+        // 인자에 명시된 서비스 외에는 절대 손대지 않음.
+        stage('B. Apply infra services (compose up -d)') {
+            steps {
+                sh '''#!/usr/bin/env bash
+                    set -euo pipefail
+                    cd "$SOURCE_DIR/infra/compose"
+
+                    # docker-compose.prod.yml 변경사항 감지 (SHA256 비교)
+                    old_hash=$(git show "origin/$GIT_BRANCH:infra/compose/docker-compose.prod.yml" 2>/dev/null \
+                      | sha256sum | awk '{print $1}' || echo "missing")
+                    new_hash=$(sha256sum docker-compose.prod.yml | awk '{print $1}')
+
+                    if [ "$old_hash" = "$new_hash" ]; then
+                      echo "[apply] docker-compose.prod.yml unchanged (hash: $new_hash)"
+                      # 변경 없음: 자동 감지로 필요한 것만 재시작
+                      docker compose --env-file ../env/prod.env -f docker-compose.prod.yml \
+                        up -d postgres redis elasticsearch kibana filebeat
+                    else
+                      echo "[apply] docker-compose.prod.yml changed — nginx 재생성 (old: $old_hash, new: $new_hash)"
+                      # 변경 있음: nginx 명시적 recreate (nginx 볼륨/설정 변경 대비)
+                      docker compose --env-file ../env/prod.env -f docker-compose.prod.yml \
+                        up -d --force-recreate nginx
+                      # 나머지는 자동 감지 (stateful 안전)
+                      docker compose --env-file ../env/prod.env -f docker-compose.prod.yml \
+                        up -d postgres redis elasticsearch kibana filebeat
+                    fi
+
+                    # Django(UID 10001)가 쓸 수 있도록 공유 볼륨 소유권을 보장합니다.
+                    # 불필요한 I/O를 피하기 위해 소유자가 10001이 아닐 때만 chown을 실행합니다.
+                    echo "[apply] checking vmd_django_media owner"
+                    owner=$(docker run --rm -v vmd_django_media:/data alpine:3.18 sh -c "stat -c %u /data 2>/dev/null || echo missing") || owner=missing
+                    if [ "$owner" != "10001" ]; then
+                      echo "[apply] vmd_django_media owner=$owner != 10001 — running chown"
+                      docker run --rm -v vmd_django_media:/data alpine:3.18 sh -c "chown -R 10001:10001 /data" || true
+                      echo "[apply] vmd_django_media ownership fixed"
+                    else
+                      echo "[apply] vmd_django_media already owned by 10001 — skipping chown"
+                    fi
+                '''
+            }
+        }
+
+        // ══════════════ B2. Reload nginx ══════════════
+        // nginx 설정 파일은 호스트 ./nginx/conf 를 ro 마운트라 파일 변경은 즉시 반영되지만
+        // worker 가 새 config 를 읽으려면 reload 가 필요. idempotent (1초 미만, downtime 0).
+        // stage B 에서 nginx 가 새로 기동된 경우엔 이미 새 config 라 reload 가 no-op 에 가까움.
+        stage('B2. Reload nginx') {
+            steps {
+                sh '''#!/usr/bin/env bash
+                    set -euo pipefail
+                    if docker ps --format '{{.Names}}' | grep -qx "$NGINX_CONTAINER"; then
+                      docker exec "$NGINX_CONTAINER" nginx -s reload
+                      echo "[reload] nginx -s reload OK"
+                    else
+                      echo "[reload] $NGINX_CONTAINER not running — skip"
+                    fi
+                '''
+            }
+        }
+
+        // ══════════════ B3. Restart filebeat (config bind-mount reload) ══════════════
+        // filebeat.yml 은 호스트 ./elk/filebeat 를 bind mount 라 파일 변경이 compose 의
+        // hash 검증에 안 잡힘 → stage B 의 `compose up -d` 가 no-op 으로 처리. processors
+        // (dissect 등) 변경 반영을 보장하려면 명시적 restart 가 필요. (kill -HUP 은 modules
+        // 만 reload 라 본 config 는 안 됨.)
+        //
+        // 영향: vmd-filebeat 단일 컨테이너만 1-2초 재기동. registry 파일 (/usr/share/filebeat/data)
+        // 가 offset 보존하므로 로그 유실 없음.
+        // INFRA_SERVICES 에 filebeat 포함된 경우만 시도 (책임 영역 격리 일관성).
+        stage('B3. Restart filebeat (config reload)') {
+            steps {
+                sh '''#!/usr/bin/env bash
+                    set -euo pipefail
+                    if echo "$INFRA_SERVICES" | grep -qw filebeat; then
+                      if docker ps --format '{{.Names}}' | grep -qx "vmd-filebeat"; then
+                        cd "$SOURCE_DIR/infra/compose"
+                        docker compose --env-file ../env/prod.env -f docker-compose.prod.yml \
+                          restart filebeat
+                        echo "[reload] vmd-filebeat restarted (config bind-mount reload OK)"
+                      else
+                        echo "[reload] vmd-filebeat not running — skip (will be created by stage B)"
+                      fi
+                    else
+                      echo "[reload] filebeat not in INFRA_SERVICES — skip"
+                    fi
+                '''
+            }
+        }
+
+        // ══════════════ C. Wait healthy ══════════════
+        // INFRA_SERVICES 컨테이너 모두 healthy 까지 폴링 (max HEALTH_WAIT_SEC).
+        // healthcheck 미정의 컨테이너는 'none' 반환 → 즉시 통과로 간주.
+        stage('C. Wait until healthy') {
+            steps {
+                sh '''#!/usr/bin/env bash
+                    set -euo pipefail
+                    DEADLINE=$(( $(date +%s) + HEALTH_WAIT_SEC ))
+
+                    for svc in $INFRA_SERVICES; do
+                      # compose 컨테이너 이름 규약: vmd-<service> (compose.prod.yml 의 container_name)
+                      container="vmd-${svc}"
+                      echo "[health] polling $container (timeout $(( DEADLINE - $(date +%s) ))s)"
+                      attempt=0
+                      while (( $(date +%s) < DEADLINE )); do
+                        attempt=$(( attempt + 1 ))
+                        status=$(docker inspect -f '{{.State.Health.Status}}' "$container" 2>/dev/null || echo "absent")
+                        case "$status" in
+                          healthy)
+                            echo "[health] $container HEALTHY (attempt #${attempt})"
+                            break ;;
+                          none|"<no value>")
+                            # healthcheck 미정의 → State.Status 만 확인
+                            running=$(docker inspect -f '{{.State.Status}}' "$container" 2>/dev/null || echo "absent")
+                            if [[ "$running" == "running" ]]; then
+                              echo "[health] $container running (no healthcheck defined)"
+                              break
+                            fi ;;
+                          unhealthy)
+                            echo "[health] $container UNHEALTHY — dumping last 100 lines" >&2
+                            docker logs --tail 100 "$container" 2>&1 | sed 's/^/  /' >&2 || true
+                            exit 1 ;;
+                          absent)
+                            echo "[health] $container not found (attempt #${attempt})" >&2 ;;
+                          *)
+                            echo "[health] $container status=$status (attempt #${attempt})" ;;
+                        esac
+                        sleep 3
+                      done
+
+                      # while 빠져나왔는데 아직 healthy/running 이 아니면 timeout
+                      status=$(docker inspect -f '{{.State.Health.Status}}' "$container" 2>/dev/null || echo "absent")
+                      running=$(docker inspect -f '{{.State.Status}}' "$container" 2>/dev/null || echo "absent")
+                      if [[ "$status" != "healthy" && "$running" != "running" ]]; then
+                        echo "[health] TIMEOUT — $container (status=$status running=$running)" >&2
+                        docker logs --tail 100 "$container" 2>&1 | sed 's/^/  /' >&2 || true
+                        exit 1
+                      fi
+                    done
+
+                    echo "[health] all INFRA_SERVICES OK"
+                '''
+            }
+        }
+
+        // ══════════════ D. External smoke + memory ══════════════
+        stage('D. External smoke check') {
+            when { expression { !params.SKIP_SMOKE } }
+            steps {
+                sh '''#!/usr/bin/env bash
+                    set -euo pipefail
+
+                    # 외부 도메인 응답 — nginx + Django (기존 BE 컨테이너) 까지 정상 도달 확인.
+                    # /api/v1/hello 는 BE healthcheck 가 쓰는 동일 엔드포인트 (compose.prod.yml).
+                    # BE 가 /healthz 추가하면 그것으로 교체.
+                    code=$(curl -k -o /dev/null -s -w "%{http_code}" "$BASE_URL/api/v1/hello" || echo "000")
+                    echo "[smoke] $BASE_URL/api/v1/hello → $code"
+                    if [[ "$code" != "200" ]]; then
+                      echo "[smoke] FAIL — expected 200, got $code" >&2
+                      exit 1
+                    fi
+
+                    # 메모리 여유 — 인프라 추가(특히 ELK)로 OOM 압박 가시화
+                    mem_avail_kb=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)
+                    mem_total_kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)
+                    avail_pct=$(( mem_avail_kb * 100 / mem_total_kb ))
+                    echo "[smoke] memory available: ${avail_pct}% (${mem_avail_kb}/${mem_total_kb} kB)"
+                    if (( avail_pct < 15 )); then
+                      echo "[smoke] WARN — available memory < 15% (배포는 통과시키되 ELK 등 추가 도입 시 swapfile 검토)" >&2
+                    fi
+                '''
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "[Infra Deploy OK]  sha=${env.NEW_SHA}  services='${env.INFRA_SERVICES}'  duration=${currentBuild.durationString}"
+            script { notifyMattermost('SUCCESS', '#36a64f', '✅') }
+        }
+        failure {
+            // 자동 롤백 없음 (plan §7.1) — 운영자가 git revert 또는 SSH 직접 개입.
+            // INFRA_SERVICES 외 서비스는 본 Job 이 손대지 않았으므로 BE/AI/FE 영향 없음.
+            echo "[Infra Deploy FAIL]  sha=${env.NEW_SHA ?: 'n/a'}  → 운영자 판단 필요. ${env.BUILD_URL}console"
+            script { notifyMattermost('FAILURE', '#d62728', '❌') }
+        }
+        aborted {
+            echo "[Infra Deploy ABORTED]  sha=${env.NEW_SHA ?: 'n/a'}"
+            script { notifyMattermost('ABORTED', '#7f7f7f', '🚫') }
+        }
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Helpers
+// ═════════════════════════════════════════════════════════════════════════════
+
+// Mattermost 알림 — Jenkins Credentials 'mm-webhook-deploy' (Secret text) 사용.
+// mm 장애 ≠ 배포 fail 이므로 try/catch 로 감쌈.
+void notifyMattermost(String result, String color, String emoji) {
+    try {
+        withCredentials([string(credentialsId: 'mm-webhook-deploy', variable: 'MM_URL')]) {
+            String payload = """
+            {
+              "username": "Jenkins",
+              "icon_emoji": ":jenkins:",
+              "attachments": [{
+                "color": "${color}",
+                "title": "${emoji} VMD Infra Deploy ${result}",
+                "title_link": "${env.BUILD_URL}console",
+                "fields": [
+                  {"title": "Branch",   "value": "${params.GIT_BRANCH}",          "short": true},
+                  {"title": "SHA",      "value": "${env.NEW_SHA ?: 'n/a'}",       "short": true},
+                  {"title": "Services", "value": "${env.INFRA_SERVICES}",         "short": true},
+                  {"title": "Duration", "value": "${currentBuild.durationString}", "short": true}
+                ]
+              }]
+            }
+            """.trim()
+
+            sh """#!/usr/bin/env bash
+                set -e
+                curl -fsS -X POST -H 'Content-type: application/json; charset=utf-8' \\
+                  --data '${payload.replace("'", "'\\''")}' \\
+                  "\$MM_URL"
+            """
+        }
+    } catch (Throwable t) {
+        echo "[mm-notify][WARN] notification failed: ${t.message}"
+    }
+}

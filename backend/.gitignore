@@ -1,0 +1,5 @@
+media/
+staticfiles/
+.coverage
+coverage.xml
+report.xml

@@ -1,0 +1,25 @@
+# =============================================================================
+#  .gitattributes — VMD 3D Layout Service
+# -----------------------------------------------------------------------------
+#  Windows 의 git autocrlf=true 가 .sh / .env 파일에도 CRLF 를 박아 넣어,
+#  scp / rsync 로 직접 Linux 호스트에 전달 시 bash 가 `\r` 을 명령으로 인식하며
+#  깨지는 함정 방지 (CLAUDE.md gotcha §10).
+#
+#  발견 사례: 2026-05-04 setup_swap.sh 를 Windows 에서 SCP → EC2 실행 시
+#             "$'\r': command not found" / "set: pipefail: invalid option name".
+#
+#  본 정책: text 파일이지만 line ending 은 LF 로 강제 (전 플랫폼 통일).
+# =============================================================================
+
+# Shell scripts — 직접 실행되는 파일은 반드시 LF
+*.sh text eol=lf
+
+# Environment files — bash 의 source 가 \r 를 값에 포함시키는 이슈 방지
+*.env       text eol=lf
+*.env.example text eol=lf
+
+# Cron 정의 파일 — 호스트 /etc/cron.d/ 에 sudo cp 로 직접 배치되므로 LF 필수.
+infra/scripts/cron.d/* text eol=lf
+
+# Kibana ndjson — 각 line 이 JSON 객체. CRLF 시 Kibana 파싱 실패 가능.
+*.ndjson text eol=lf

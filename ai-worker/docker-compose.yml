@@ -1,0 +1,31 @@
+services:
+  redis:
+    image: redis:7.4-alpine
+    container_name: ai-redis
+    env_file:
+      - ../prod.env
+    command: >
+      sh -c 'redis-server --appendonly yes --requirepass "$$REDIS_PASSWORD"'
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+
+  ai-worker:
+    build: .
+    container_name: ai-worker
+    env_file:
+      - ../prod.env
+    environment:
+      DJANGO_SETTINGS_MODULE: ""
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./models:/models
+      - ./thumbnails:/app/thumbnails
+    restart: unless-stopped

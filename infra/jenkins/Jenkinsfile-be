@@ -1,0 +1,437 @@
+// =============================================================================
+//  infra/jenkins/Jenkinsfile-be — VMD Backend Blue/Green Deploy (Option A)
+// -----------------------------------------------------------------------------
+//  설계 근거: operations_activation_plan.md §1.3, §6.5
+//
+//  배포 모델: Option A (Jenkins 호스트 직접 빌드, no registry, no SSH)
+//    - Jenkins 와 prod 가 같은 EC2 호스트에 공존 → SSH 불필요
+//    - SSAFY GitLab Container Registry 미가용 → docker pull 불가
+//    - /opt/vmd/source 가 운영 코드의 단일 진실 (env/cert/symlink 모두 여기 기준)
+//
+//  파라미터:
+//    GIT_BRANCH      배포할 브랜치 (default: dev)
+//    SKIP_MIGRATION  Django migration 건너뛰기 (hotfix 재배포용)
+//    SKIP_SMOKE      배포 후 smoke check 건너뛰기
+//
+//  실행 흐름:
+//    A) /opt/vmd/source 를 origin/$GIT_BRANCH 에 hard reset
+//    B) 활성 색상 감지 (nginx symlink 기준)
+//    C) standby Django 빌드 (현재 worktree)
+//    D) DB migration (standby 컨테이너로 1회)
+//    E) standby 부팅 + healthz 대기
+//    F) 수동 승인 게이트
+//    G) Nginx upstream atomic 스왑
+//    H) DRAIN 후 이전 active stop
+//    I) celery-worker 재빌드 + recreate (코드 동기화)
+//    J) /api/v1/hello smoke check
+//
+//  실패 시 자동 cleanup (post.failure) — 시점별 분기:
+//    - traffic_switched=true (stage G 통과 후 fail):
+//        자동 cleanup 안 함. 사용자 트래픽은 새 standby(=active 가 됨) 로 정상 라우팅 유지.
+//        옛 active 는 이미 stage H 에서 stop 됐으므로 자동 원복 시도 시 nginx -t fail
+//        → standby 까지 stop 하면 운영 down. → 운영자 수동 판단 (재배포 vs git revert).
+//    - standby_booted=true && traffic_switched=false (stage E~F 사이 fail):
+//        standby 안전하게 stop (active 무영향).
+//    - standby_booted=false (stage A~D 사이 fail):
+//        cleanup 불필요.
+//
+//  Jenkins 전제:
+//    - jenkins 사용자가 docker 그룹 (sudo usermod -aG docker jenkins)
+//    - /opt/vmd/source 가 jenkins 쓰기 가능 (chown -R jenkins:jenkins /opt/vmd/source)
+//    - GitLab read 권한 SSH key 또는 PAT (Manage → Credentials)
+// =============================================================================
+
+pipeline {
+    agent any
+
+    parameters {
+        string(
+            name: 'GIT_BRANCH',
+            defaultValue: 'dev',
+            description: '배포할 브랜치 (default: dev — 본 프로젝트의 release 브랜치)'
+        )
+        booleanParam(
+            name: 'SKIP_MIGRATION',
+            defaultValue: false,
+            description: 'Django migration 건너뛰기 (hotfix)'
+        )
+        booleanParam(
+            name: 'SKIP_SMOKE',
+            defaultValue: false,
+            description: '배포 후 smoke check 건너뛰기'
+        )
+    }
+
+    options {
+        timestamps()
+        ansiColor('xterm')
+        disableConcurrentBuilds()
+        timeout(time: 60, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '30'))
+    }
+
+    environment {
+        // Git plugin 이 SCM checkout 단계에서 GIT_BRANCH=origin/<branch> 로 자동 set
+        // → parameter 의 GIT_BRANCH 를 명시 override 안 하면 'git fetch origin origin/dev' 가 됨
+        GIT_BRANCH     = "${params.GIT_BRANCH}"
+        SOURCE_DIR     = '/opt/vmd/source'
+        BASE_URL       = 'https://do-goproject.com'
+        HEALTH_TIMEOUT = '180'
+        DRAIN_SECONDS  = '60'
+    }
+
+    stages {
+
+        // ══════════════ A. Sync ══════════════
+        stage('A. Sync canonical source') {
+            steps {
+                sh '''#!/usr/bin/env bash
+                    set -euo pipefail
+                    cd "$SOURCE_DIR"
+                    git fetch --quiet origin "$GIT_BRANCH"
+                    git checkout --quiet "$GIT_BRANCH"
+                    git reset --hard "origin/$GIT_BRANCH"
+                    git rev-parse --short HEAD > .deploy_sha
+                    echo "[deploy] $SOURCE_DIR @ $(cat .deploy_sha) (branch $GIT_BRANCH)"
+                '''
+                script {
+                    env.NEW_SHA = sh(
+                        returnStdout: true,
+                        script: 'cat "$SOURCE_DIR/.deploy_sha"'
+                    ).trim()
+                }
+            }
+        }
+
+        // ══════════════ A2. Sync prod env (Jenkins Credentials → disk) ══════════════
+        // Jenkins Credentials Secret file 'vmd-prod-env' 가 단일 진실. 매 빌드마다
+        // 디스크의 ../env/prod.env 를 덮어써서 compose 가 정상 로드 (env_file: 가
+        // YAML 안에 ../env/prod.env 로 hardcode 되어 있어 disk 위치 필요).
+        stage('A2. Sync prod env from Jenkins Credentials') {
+            steps {
+                withCredentials([file(credentialsId: 'vmd-prod-env', variable: 'PROD_ENV_FILE')]) {
+                    sh '''#!/usr/bin/env bash
+                        set -euo pipefail
+                        install -m 600 "$PROD_ENV_FILE" "$SOURCE_DIR/infra/env/prod.env"
+                        echo "[deploy] synced prod.env from Jenkins Credentials (vmd-prod-env)"
+                    '''
+                }
+            }
+        }
+
+        // ══════════════ A3. Inject build-time release tag ══════════════
+        // Sentry 가 first-seen/last-seen 을 release 별로 grouping + regression
+        // 감지하려면 sentry_sdk.init(release=...) 에 빌드 SHA 가 필요.
+        // Credential 에는 SENTRY_RELEASE 빈 값 (사용자 무관) — Jenkins 가 이 단계에서
+        // 매 배포 SHA 를 주입. 같은 키 라인 제거 후 마지막에 append 하여 단일 진실 유지.
+        stage('A3. Inject SENTRY_RELEASE') {
+            steps {
+                sh '''#!/usr/bin/env bash
+                    set -euo pipefail
+                    ENV_FILE="$SOURCE_DIR/infra/env/prod.env"
+                    SHA=$(cat "$SOURCE_DIR/.deploy_sha")
+                    # 기존 SENTRY_RELEASE 라인 제거 후 새 값 append (멱등)
+                    sed -i '/^SENTRY_RELEASE=/d' "$ENV_FILE"
+                    printf 'SENTRY_RELEASE=%s\n' "$SHA" >> "$ENV_FILE"
+                    echo "[deploy] injected SENTRY_RELEASE=$SHA"
+                '''
+            }
+        }
+
+        // ══════════════ B. Resolve colors ══════════════
+        stage('B. Detect active color') {
+            steps {
+                script {
+                    def active = sh(
+                        returnStdout: true,
+                        script: '''
+                            readlink "$SOURCE_DIR/infra/nginx/conf/conf.d/00-upstream-active.conf" 2>/dev/null \
+                              | grep -oE "blue|green" || echo blue
+                        '''
+                    ).trim()
+                    env.ACTIVE_COLOR     = active
+                    env.STANDBY_COLOR    = (active == 'blue') ? 'green' : 'blue'
+                    env.STANDBY_BOOTED   = 'false'
+                    env.TRAFFIC_SWITCHED = 'false'
+
+                    echo """
+                    ═══════════════ VMD BE Deploy ═══════════════
+                      branch  : ${params.GIT_BRANCH}
+                      sha     : ${env.NEW_SHA}
+                      active  : ${env.ACTIVE_COLOR}
+                      standby : ${env.STANDBY_COLOR}
+                      build   : ${env.BUILD_URL}
+                    ═════════════════════════════════════════════
+                    """.stripIndent()
+                }
+            }
+        }
+
+        // ══════════════ C. Build ══════════════
+        stage('C. Build standby Django image') {
+            steps {
+                sh '''#!/usr/bin/env bash
+                    set -euo pipefail
+                    cd "$SOURCE_DIR/infra/compose"
+                    docker compose --env-file ../env/prod.env -f docker-compose.prod.yml --profile green \
+                      build "django-$STANDBY_COLOR"
+                '''
+            }
+        }
+
+        // ══════════════ D. Migration ══════════════
+        stage('D. DB migration (backward-compatible)') {
+            when { expression { !params.SKIP_MIGRATION } }
+            steps {
+                sh '''#!/usr/bin/env bash
+                    set -euo pipefail
+                    cd "$SOURCE_DIR/infra/compose"
+                    docker compose --env-file ../env/prod.env -f docker-compose.prod.yml --profile green \
+                      run --rm "django-$STANDBY_COLOR" python manage.py migrate --noinput
+                '''
+            }
+        }
+
+        // ══════════════ E. Boot + Health ══════════════
+        stage('E. Boot standby + health check') {
+            steps {
+                sh '''#!/usr/bin/env bash
+                    set -euo pipefail
+                    cd "$SOURCE_DIR/infra/compose"
+                    docker compose --env-file ../env/prod.env -f docker-compose.prod.yml --profile green \
+                      up -d --force-recreate "django-$STANDBY_COLOR"
+                '''
+                script { env.STANDBY_BOOTED = 'true' }
+                sh '''#!/usr/bin/env bash
+                    set -euo pipefail
+                    bash "$SOURCE_DIR/infra/scripts/health_check.sh" "$STANDBY_COLOR" "$HEALTH_TIMEOUT"
+                '''
+            }
+        }
+
+        // ══════════════ F. Approval Gate (auto-confirm after 3min) ══════════════
+        // Level 2 자동 배포: 평소엔 3분 idle 후 자동 통과 (Switch).
+        // 사고 시 운영자가 mm 알림 받고 그 안에 abort 클릭 가능 (응급 escape hatch).
+        //
+        // timeout 과 abort 를 반드시 구분해야 함:
+        //   - 3분 idle (timeout)  → 자동 통과 (정상 흐름) → stage G 진행
+        //   - 운영자 Abort 클릭     → 진짜 중단 (post.aborted) → stage G 차단
+        // catchError 한 덩어리로 묶으면 둘 다 SUCCESS 로 처리되어 abort 가 무력화됨.
+        // → try/catch 로 감싸고 cause class 로 둘을 구분.
+        stage('F. Manual approval (auto-confirm 3min)') {
+            steps {
+                script {
+                    try {
+                        timeout(time: 3, unit: 'MINUTES') {
+                            input(
+                                message: "Switch prod BE traffic: ${env.ACTIVE_COLOR} → ${env.STANDBY_COLOR}? (자동 통과: 3분, abort 가능)",
+                                ok: "Switch to ${env.STANDBY_COLOR} now",
+                                submitterParameter: 'APPROVED_BY'
+                            )
+                        }
+                        echo "[F] Operator approved: switching → ${env.STANDBY_COLOR}"
+                    } catch (err) {
+                        // input 의 Abort 클릭은 Rejection cause, timeout 은 ExceededTimeout cause.
+                        // FlowInterruptedException 의 causes 를 보고 분기.
+                        def causes = err.causes ?: []
+                        def isAbort = causes.any { it?.class?.simpleName?.contains('Rejection') }
+                        if (isAbort) {
+                            error("[F] Operator aborted at approval gate")
+                        }
+                        echo "[F] 3분 idle — auto-confirming switch → ${env.STANDBY_COLOR}"
+                    }
+                }
+            }
+        }
+
+        // ══════════════ G. Switch ══════════════
+        stage('G. Switch Nginx upstream') {
+            steps {
+                sh '''#!/usr/bin/env bash
+                    set -euo pipefail
+                    bash "$SOURCE_DIR/infra/scripts/switch_color.sh" "$STANDBY_COLOR"
+                '''
+                script { env.TRAFFIC_SWITCHED = 'true' }
+            }
+        }
+
+        // ══════════════ H. Drain + Stop ══════════════
+        stage('H. Drain + stop old Django') {
+            steps {
+                sh '''#!/usr/bin/env bash
+                    set -euo pipefail
+                    echo "[deploy] draining ${DRAIN_SECONDS}s on $ACTIVE_COLOR"
+                    sleep "$DRAIN_SECONDS"
+                    cd "$SOURCE_DIR/infra/compose"
+                    docker compose --env-file ../env/prod.env -f docker-compose.prod.yml --profile green \
+                      stop "django-$ACTIVE_COLOR"
+                '''
+            }
+        }
+
+        // ══════════════ I. Celery sync ══════════════
+        stage('I. Rebuild + recreate celery-worker') {
+            steps {
+                sh '''#!/usr/bin/env bash
+                    set -euo pipefail
+                    cd "$SOURCE_DIR/infra/compose"
+                    docker compose --env-file ../env/prod.env -f docker-compose.prod.yml \
+                      build celery-worker
+                    docker compose --env-file ../env/prod.env -f docker-compose.prod.yml \
+                      up -d --force-recreate celery-worker
+                '''
+            }
+        }
+
+        // ══════════════ J. Smoke ══════════════
+        stage('J. Smoke check') {
+            when { expression { !params.SKIP_SMOKE } }
+            steps {
+                script {
+                    retry(3) {
+                        sleep time: 5, unit: 'SECONDS'
+                        // HTTP/2 default 사용 (--http1.1 옵션 X) — 사용자 브라우저와 같은 프로토콜로 검증.
+                        // smoke check 가 lenient 한 HTTP/1.1 로 통과해도 사용자(HTTP/2)에게는 깨질 수 있음.
+                        // → 이 단계가 사용자 신호의 first-line: 빌드 깨짐 = 사용자에게도 깨진다는 뜻.
+                        //
+                        // nginx 응답 헤더가 RFC 9113 위반이면 curl 이 exit 92
+                        // ("Invalid HTTP header field") 로 fail → post.failure cleanup 발동.
+                        // 위반 4 패턴:
+                        //   1. obs-fold — header value 안에 LF + leading whitespace
+                        //      예: add_header CSP "...; \<LF>  script-src ..."
+                        //      nginx 의 add_header 는 백슬래시를 line continuation 으로 해석 안 함
+                        //      → 응답 헤더에 LF 가 그대로 박힘. RFC 9113 §8.2.1 금지. (#9 빌드 사고 원인)
+                        //   2. CR/LF/NUL 등 control 문자가 header value 에 포함
+                        //      예: 변수 확장으로 줄바꿈 침투, upstream(Django) 이 sanitize 안 된
+                        //          사용자 입력을 그대로 헤더로 내려보낸 경우 (header injection 취약점).
+                        //   3. Connection-specific 헤더 응답 포함 (RFC 9113 §8.2.2 금지):
+                        //      Connection, Keep-Alive, Transfer-Encoding, Upgrade, Proxy-Connection.
+                        //      proxy_pass_header 로 upstream 헤더 그대로 전달 시 위험.
+                        //   4. 대문자 필드명 — HTTP/2 는 field name 전부 lowercase 강제.
+                        //      nginx 본체는 lowercase 출력하지만 일부 module/upstream 이 위반 가능.
+                        //
+                        // 빌드가 stage J 에서 fail 시 진단:
+                        //   curl -i --max-time 15 "$BASE_URL/api/v1/hello"
+                        //   → 응답 헤더 raw dump 로 위 4 패턴 중 어느 것 위반인지 확인.
+                        // 또는 사고 직후 일시 우회가 필요하면 SKIP_SMOKE=true 로 빌드 (단, 운영 검증 별도 필수).
+                        sh 'curl -fsS --max-time 15 "$BASE_URL/api/v1/hello"'
+                    }
+                }
+            }
+        }
+    }
+
+    // ══════════════════════ POST ══════════════════════
+    post {
+        success {
+            echo "[BE Deploy OK]  sha=${env.NEW_SHA}  active=${env.STANDBY_COLOR}  duration=${currentBuild.durationString}"
+            script { notifyMattermost('SUCCESS', '#36a64f', "✅") }
+        }
+
+        failure {
+            script {
+                echo "[post.failure] standby_booted=${env.STANDBY_BOOTED}  traffic_switched=${env.TRAFFIC_SWITCHED}  active=${env.ACTIVE_COLOR}  standby=${env.STANDBY_COLOR}"
+
+                if (env.TRAFFIC_SWITCHED == 'true') {
+                    // Stage G(switch) 통과 후 fail (보통 stage I/J 의 celery 또는 smoke fail).
+                    // 시점 분석:
+                    //   - 새 standby (=${STANDBY_COLOR}) 가 트래픽을 받는 active 가 됨
+                    //   - 옛 active (=${ACTIVE_COLOR}) 는 stage H 에서 이미 stop 됨 (컨테이너 dead)
+                    //   - 자동 트래픽 원복 시도 시 nginx -t 가 dead upstream 으로 fail
+                    //   - 그 후 standby 까지 stop 하면 운영 down (502)
+                    //
+                    // → 자동 cleanup 안 함. 사용자 트래픽은 ${STANDBY_COLOR} 로 정상 라우팅 유지.
+                    //   운영자가 fail 사유 확인 후 수동 판단 (별도 fix 후 재배포 vs git revert).
+                    echo "[rollback][SKIP] 트래픽 이미 ${env.STANDBY_COLOR} 으로 전환됨. 자동 원복/standby stop 안 함."
+                    echo "[rollback] 사용자 트래픽: ${env.STANDBY_COLOR} 컨테이너로 정상 라우팅 중 (stage I/J 만 fail, 기능은 동작)."
+                    echo "[rollback] 운영자 수동 조치 필요:"
+                    echo "[rollback]   1) curl https://do-goproject.com/api/v1/hello — 200 인지 확인"
+                    echo "[rollback]   2) 정상이면 → fail 한 stage(I/J) 의 진짜 원인 fix 후 재배포"
+                    echo "[rollback]   3) 비정상이면 → git revert 후 GIT_BRANCH=<prev-sha> 재배포"
+                } else if (env.STANDBY_BOOTED == 'true') {
+                    // Stage E~F 사이 fail. standby 가 booted 됐지만 트래픽 미수신.
+                    // → standby 안전하게 stop (active 무영향).
+                    try {
+                        sh '''#!/usr/bin/env bash
+                            cd "$SOURCE_DIR/infra/compose"
+                            docker compose --env-file ../env/prod.env -f docker-compose.prod.yml --profile green \
+                              stop "django-$STANDBY_COLOR" || true
+                        '''
+                        echo "[rollback] standby Django (${env.STANDBY_COLOR}) stopped — active(${env.ACTIVE_COLOR}) 무영향"
+                    } catch (Throwable t) {
+                        echo "[rollback][ERROR] standby stop failed: ${t}"
+                    }
+                } else {
+                    echo "[rollback] 부팅된 standby 없음 (stage A~D 사이 fail) — 추가 cleanup 불필요"
+                }
+
+                echo "[BE Deploy FAIL]  sha=${env.NEW_SHA ?: 'n/a'}  see ${env.BUILD_URL}console"
+                notifyMattermost('FAILURE', '#d62728', "❌")
+            }
+        }
+
+        aborted {
+            echo "[BE Deploy ABORTED]  sha=${env.NEW_SHA ?: 'n/a'}"
+            script { notifyMattermost('ABORTED', '#7f7f7f', "🚫") }
+        }
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Helpers
+// ═════════════════════════════════════════════════════════════════════════════
+
+// Mattermost 알림 — Jenkins Credentials 'mm-webhook-deploy' (Secret text) 사용.
+// 실패 시 빌드 자체에 영향 안 주도록 try/catch 로 감쌈 (mm 장애 ≠ 배포 fail).
+//
+// payload 구조 (mm Incoming Webhook):
+//   color: SUCCESS=green, FAILURE=red, ABORTED=grey
+//   fields: branch / sha / active / duration / 자동롤백 결과 (failure 시)
+void notifyMattermost(String result, String color, String emoji) {
+    try {
+        withCredentials([string(credentialsId: 'mm-webhook-deploy', variable: 'MM_URL')]) {
+            // post.failure 의 자동 cleanup 결과를 알림에 포함 (운영자가 mm 만 봐도 상황 파악)
+            String cleanupSummary = ''
+            if (result == 'FAILURE') {
+                if (env.TRAFFIC_SWITCHED == 'true') {
+                    cleanupSummary = "*트래픽 이미 ${env.STANDBY_COLOR} 으로 전환됨. 자동 cleanup 안 함 (사용자 무영향).* 운영자 수동 판단 필요."
+                } else if (env.STANDBY_BOOTED == 'true') {
+                    cleanupSummary = "Standby (${env.STANDBY_COLOR}) stop 완료. Active (${env.ACTIVE_COLOR}) 무영향."
+                } else {
+                    cleanupSummary = "Standby 부팅 전 fail. cleanup 불필요."
+                }
+            }
+
+            String activeNow = (env.TRAFFIC_SWITCHED == 'true') ? env.STANDBY_COLOR : env.ACTIVE_COLOR
+            String payload = """
+            {
+              "username": "Jenkins",
+              "icon_emoji": ":jenkins:",
+              "attachments": [{
+                "color": "${color}",
+                "title": "${emoji} VMD BE Deploy ${result}",
+                "title_link": "${env.BUILD_URL}console",
+                "fields": [
+                  {"title": "Branch",   "value": "${params.GIT_BRANCH}",        "short": true},
+                  {"title": "SHA",      "value": "${env.NEW_SHA ?: 'n/a'}",     "short": true},
+                  {"title": "Active",   "value": "${activeNow ?: 'n/a'}",       "short": true},
+                  {"title": "Duration", "value": "${currentBuild.durationString}", "short": true}
+                  ${cleanupSummary ? ',' : ''}
+                  ${cleanupSummary ? "{\"title\": \"Cleanup\", \"value\": \"${cleanupSummary}\", \"short\": false}" : ''}
+                ]
+              }]
+            }
+            """.trim()
+
+            sh """#!/usr/bin/env bash
+                set -e
+                curl -fsS -X POST -H 'Content-type: application/json; charset=utf-8' \\
+                  --data '${payload.replace("'", "'\\''")}' \\
+                  "\$MM_URL"
+            """
+        }
+    } catch (Throwable t) {
+        // mm 알림 실패는 빌드 결과에 영향 X — log 만 남김.
+        echo "[mm-notify][WARN] notification failed: ${t.message}"
+    }
+}

@@ -1,0 +1,87 @@
+services:
+  db:
+    image: postgis/postgis:16-3.4
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  backend:
+    build: ./backend
+    env_file: .env
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
+  worker:
+    build: ./backend
+    env_file: .env
+    environment:
+      RUN_MIGRATIONS: "0"
+    command: celery -A config worker -l INFO
+    volumes:
+      - ./backend:/app
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
+  frontend:
+    image: node:22-alpine
+    working_dir: /app
+    command: sh -c "npm install && npm run dev -- --host 0.0.0.0"
+    environment:
+      VITE_API_BASE_URL: http://localhost:8000
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./frontend:/app
+      - frontend_node_modules:/app/node_modules
+
+  ai-worker:
+    build:
+      context: ./ai-worker
+      dockerfile: Dockerfile
+    env_file: .env
+    environment:
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+      CELERY_AI_QUEUE: ai
+      YOLO_MODEL_PATH: /models/best.pt
+      YOLO_DEVICE: cpu
+      YOLO_CONF_THRESHOLD: "0.35"
+      YOLO_IOU_THRESHOLD: "0.50"
+      YOLO_IMG_SIZE: "1024"
+      YOLO_READY_FLAG_PATH: /tmp/worker_ready
+    depends_on:
+      redis:
+        condition: service_started
+    volumes:
+      - ./ai-worker/models:/models:ro
+      - ./ai-worker/thumbnails:/app/thumbnails
+
+
+volumes:
+  postgres_data:
+  frontend_node_modules:

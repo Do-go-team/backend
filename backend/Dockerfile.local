@@ -1,0 +1,29 @@
+FROM python:3.12-slim
+
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    binutils \
+    libproj-dev \
+    gdal-bin \
+    libgdal-dev \
+    python3-gdal \
+    netcat-openbsd \
+    fonts-noto-cjk \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --upgrade pip && pip install --no-cache-dir -r requirements.txt
+
+# Source is bind-mounted via docker-compose, so we place the entrypoint
+# outside /app to avoid being shadowed by the mount.
+COPY entrypoint.local.sh /usr/local/bin/entrypoint.local.sh
+RUN sed -i 's/\r$//' /usr/local/bin/entrypoint.local.sh \
+    && chmod +x /usr/local/bin/entrypoint.local.sh
+
+EXPOSE 8000
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.local.sh"]
